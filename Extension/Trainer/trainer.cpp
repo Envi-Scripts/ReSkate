@@ -131,6 +131,7 @@ struct State {
     // The no comply and the boneless are launched by the trick scripts too (trainer_jump.cpp).
     float nocomply_height{1}, boneless_height{1};
     float revert_boost{};            // 0: off
+    RevertTuning revert;
     std::uint64_t revert_boosts_seen{};
     std::uint32_t last_state{};
     float boost_factor{}; // velocity factor of the jump now starting, 0: none
@@ -282,6 +283,26 @@ CameraSet read_camera(const Json &row, CameraSet set) {
 }
 Json write_position(const Vec3 &p) { return Json::array({Json(p[0]), Json(p[1]), Json(p[2])}); }
 
+struct RevertField {
+    std::string_view name;
+    float RevertTuning::*member;
+    float low, high;
+};
+constexpr RevertField revert_fields[]{
+    {"spin", &RevertTuning::min_spin, 0.0f, 100000.0f},     {"slip", &RevertTuning::min_slip, 0.0f, 90.0f},
+    {"twist", &RevertTuning::min_twist, 0.0f, 90.0f},       {"bend", &RevertTuning::bend_boost, -1000.0f, 1000.0f},
+    {"full", &RevertTuning::full_boost, -1000.0f, 1000.0f}, {"auto", &RevertTuning::auto_boost, -1000.0f, 1000.0f},
+    {"max_speed", &RevertTuning::max_speed, 0.0f, 1000.0f}, {"cooldown", &RevertTuning::cooldown, 0.0f, 60.0f},
+    {"min_air", &RevertTuning::min_air, 0.0f, 60.0f},
+};
+RevertTuning sane_revert(RevertTuning tuning) {
+    const RevertTuning stock;
+    for (const auto &field : revert_fields) {
+        auto &value = tuning.*field.member;
+        value = std::isfinite(value) ? std::clamp(value, field.low, field.high) : stock.*field.member;
+    }
+    return tuning;
+}
 RigSetting sane_rig(RigSetting rig);
 void load_store() {
     auto &s = state();
@@ -319,6 +340,12 @@ void load_store() {
         if (json->contains("active") && json->at("active").is_array())
             for (const auto &name : json->at("active"))
                 if (name.is_string()) s.active.push_back(name.string());
+        if (json->contains("revert") && json->at("revert").is_object()) {
+            for (const auto &field : revert_fields)
+                if (const auto name = std::string(field.name); json->at("revert").contains(name) && json->at("revert").at(name).is_number())
+                    s.revert.*field.member = json->at("revert").at(name).get<float>();
+            s.revert = sane_revert(s.revert);
+        }
         if (json->contains("camera") && json->at("camera").is_object()) {
             const auto &camera = json->at("camera");
             s.camera_on = camera.value("on", false);
@@ -402,6 +429,9 @@ void save_store() {
             maps[level] = std::move(row);
         }
         json["maps"] = std::move(maps);
+        Json revert = Json::object();
+        for (const auto &field : revert_fields) revert[std::string(field.name)] = s.revert.*field.member;
+        json["revert"] = std::move(revert);
         Json camera = Json::object();
         camera["on"] = s.camera_on;
         camera["board"] = write_camera(s.camera_board);
@@ -1501,6 +1531,7 @@ void build_view() {
     next->flip_speed = s.flip_speed;
     next->boneless_height = s.boneless_height;
     next->revert_boost = s.revert_boost;
+    next->revert = s.revert;
     next->return_delay = s.return_delay;
     next->pad_shortcuts = s.pad_shortcuts;
     next->pad_menu = s.pad_menu;
@@ -1519,7 +1550,7 @@ void build_view() {
     if (const auto profile = multiplayer::gameplay_camera_profile(); profile.samples >= 60)
         next->camera_game = std::format("{:.1f} m behind, {:.1f} m up, tilt {:.0f} degrees, FOV {:.0f}", profile.distance, profile.height, profile.pitch, profile.fov);
     next->open_serial = s.open_serial;
-    next->stock = !s.camera_on && s.rigs == std::array<RigSetting, camera_rigs>{} && !next->touched && s.active.empty() && std::ranges::none_of(s.entries, &Entry::frozen) &&
+    next->stock = s.revert == RevertTuning{} && !s.camera_on && s.rigs == std::array<RigSetting, camera_rigs>{} && !next->touched && s.active.empty() && std::ranges::none_of(s.entries, &Entry::frozen) &&
                   std::ranges::all_of(trick_names, [](std::string_view name) { return *trick_option(name) == trick_stock(name); });
     next->share_text = s.share_text;
     next->share_serial = s.share_serial;
@@ -1741,7 +1772,7 @@ void tick(std::uintptr_t base, std::uintptr_t client, bool playing, const std::s
         const auto *top_speed = find_entry("physicspush.maxpushablespeed");
         set_push_speed(client, s.entity, 1.0f, top_speed ? static_cast<float>(top_speed->stock) : 0.0f, s.boosts.cruise);
         // The revert boost adds speed, so it keeps to the session's rule for boosts and to a host's physics.
-        set_revert_boost(client, s.entity, s.enforced || (multiplayer_session_active() && !session_boosts_allowed()) ? 0.0f : s.revert_boost);
+        set_revert_boost(client, s.entity, s.enforced || (multiplayer_session_active() && !session_boosts_allowed()) ? 0.0f : s.revert_boost, s.revert);
         if (const auto report = revert_boost_report(); report.sequence != s.revert_boosts_seen) {
             s.revert_boosts_seen = report.sequence;
             // Every landing with some spin in it, boosted or not, so a report can say why not.
@@ -1796,6 +1827,60 @@ RigSetting sane_rig(RigSetting rig) {
     rig.raise = finite(rig.raise, -1000.0f, 1000.0f, 0.0f);
     rig.side = finite(rig.side, -1000.0f, 1000.0f, 1.0f);
     return rig;
+}
+// ---- tricklining -------------------------------------------------------------------------------
+// trainer revert <field> <number> | reset: what counts as a revert and what it is worth.
+std::string revert_command(const std::vector<std::string> &a) {
+    auto &s = state();
+    const auto name = a.empty() ? std::string{} : lower(a[0]);
+    std::string why;
+    if (!editable(&why)) return "error: " + why;
+    if (name == "reset") {
+        s.revert = {};
+        changed();
+        return "Reverts are judged the way they shipped: 90 degrees of spin, the board 12 degrees off the travel or 40 off the body.";
+    }
+    const auto found = std::ranges::find(revert_fields, name, &RevertField::name);
+    const auto value = a.size() > 1 ? number(a[1]) : std::nullopt;
+    if (found == std::end(revert_fields) || !value) return "error: usage: trainer revert spin|slip|twist|bend|full|auto|max_speed|cooldown|min_air <number>, or revert reset";
+    s.revert.*found->member = static_cast<float>(*value);
+    s.revert = sane_revert(s.revert);
+    changed();
+    return std::format("Revert {} = {:.4g}", name, s.revert.*found->member);
+}
+// The values that make a trick line: one command sets them the way Skate 3 had them, or puts the
+// game's own back. Skate 3's are its tuning for what this game still shares with it (the "Skate 3"
+// preset) and speed back out of reverts; its heavier revert and powerslide friction is a first
+// guess (x3 and x1.5), to be tuned by playing.
+constexpr std::pair<std::string_view, double> trickline_friction[]{
+    {"onboard_powerslide.frictionscalar_revert", 3.0}, {"onboard_powerslide.frictionscalar_autorevert", 3.0}, {"onboard_powerslide.frictionscalar_slide", 1.5}};
+// trainer feel stock|easy|normal|hardcore: which game the skating plays like. The three Skate 3
+// choices are its difficulty settings (the built-in presets of those names); only one is on.
+constexpr std::pair<std::string_view, std::string_view> feels[]{{"easy", "Skate 3 Easy"}, {"normal", "Skate 3"}, {"hardcore", "Skate 3 Hardcore"}};
+std::string feel_command(const std::vector<std::string> &a) {
+    const auto which = a.empty() ? std::string{} : lower(a[0]);
+    std::string why;
+    if (!editable(&why)) return "error: " + why;
+    const auto found = std::ranges::find(feels, which, [](const auto &feel) { return feel.first; });
+    if (found == std::end(feels) && which != "stock" && which != "skate") return "error: usage: trainer feel stock|easy|normal|hardcore";
+    for (const auto &feel : feels) (void)remove_preset(feel.second);
+    if (found != std::end(feels)) (void)apply_preset(found->second);
+    changed();
+    return found == std::end(feels) ? "Plays like skate.: the game's own tuning." : std::format("Plays like {}: its tuning for everything this game shares with it.", found->second);
+}
+// trainer trickline extras on|off: what Skate 3's trick lines had beyond its tuning. Speed back
+// out of reverts, and heavier revert and powerslide friction (x3 and x1.5: a first guess).
+std::string trickline_command(const std::vector<std::string> &a) {
+    auto &s = state();
+    std::string why;
+    if (!editable(&why)) return "error: " + why;
+    bool on{};
+    if (a.size() < 2 || lower(a[0]) != "extras" || !flag(a[1], on)) return "error: usage: trainer trickline extras on|off";
+    for (const auto &[key, factor] : trickline_friction)
+        if (auto *e = find_entry(key); e && !is_locked(*e)) set_entry(*e, on ? e->stock * factor : e->stock);
+    s.revert_boost = on ? std::max(s.revert_boost, 1.0f) : 0.0f;
+    changed();
+    return on ? "Trick line extras on: speed back out of reverts, heavier revert and powerslide friction." : "Trick line extras off.";
 }
 // The game's own cameras: `trainer camera rig low|high|foot <field> <number>`, or a preset for all three.
 std::string rig_command(const std::vector<std::string> &a) {
@@ -1922,6 +2007,7 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
             s.rigs = {};
             s.hippy_height = s.nocomply_height = s.boneless_height = s.offboard_height = s.flip_speed = 1.0f;
             s.revert_boost = 0.0f;
+            s.revert = {};
             changed();
             return std::format("Everything is the game's own again: {} values put back, locks cleared, presets off, trick sliders at 1.", count);
         }
@@ -2002,6 +2088,9 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
         return "error: usage: trainer preset apply|save|delete <name>";
     }
     if (v == "camera") return camera_command(a);
+    if (v == "revert") return revert_command(a);
+    if (v == "trickline") return trickline_command(a);
+    if (v == "feel") return feel_command(a);
     if (v == "slot") {
         const auto slot = slot_argument(a, 0);
         if (!slot) return std::format("error: slots are 1 to {}.", marker_slots);
@@ -2099,9 +2188,9 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
     if (v == "open") {
         const auto tab = lower(arg(0));
         // The last three are the Tune tab on one of its lists.
-        const std::array<std::string_view, 8> tabs{"tune", "presets", "practice", "map", "realistic", "fun", "everything", "camera"};
+        const std::array<std::string_view, 9> tabs{"tune", "presets", "practice", "map", "realistic", "fun", "everything", "camera", "trickline"};
         const auto found = std::ranges::find(tabs, tab);
-        if (!tab.empty() && found == tabs.end()) return "error: usage: trainer open [tune|presets|practice|camera|map|realistic|fun|everything]";
+        if (!tab.empty() && found == tabs.end()) return "error: usage: trainer open [tune|trickline|practice|camera|map|realistic|fun|everything]";
         s.open_tab = tab.empty() ? 1 : static_cast<int>(found - tabs.begin());
         ++s.open_serial;
         s.view_due = true;
