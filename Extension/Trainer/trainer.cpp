@@ -3,6 +3,7 @@
 #include "trainer_jump.h"
 #include "trainer_presets.h"
 #include "trainer_session.h"
+#include "Extension/Multiplayer/Hud/follow_camera.h"
 #include "Engine/Core/Json/json.h"
 #include "Engine/Core/Log/logging.h"
 #include "Engine/Game/Build/addresses.h"
@@ -28,6 +29,7 @@
 #include <map>
 #include <numbers>
 #include <optional>
+
 
 // Game thread only. See trainer.h for how the menu reaches this.
 namespace dingosdk::trainer {
@@ -113,6 +115,10 @@ struct State {
     MapFile map_file;
     int slot{};
     bool auto_return{}, pad_shortcuts{}, hud{}, hud_jump{}, logging{};
+    bool pad_menu{true}; // LB + RB + R3 opens and closes the menu
+    std::array<RigSetting, camera_rigs> rigs{};
+    bool camera_on{};
+    CameraSet camera_board, camera_foot{1.9f, 1.6f, -8.0f, 0.4f, 0.0f, 0.06f};
     // The hippy jump's height is set by the game's trick scripts, not by tuning: the trainer
     // scales the upward velocity when it sees one start.
     float hippy_height{1};
@@ -141,6 +147,8 @@ struct State {
     SessionExtras host;
     std::array<float, class_field_count> host_classes{};
     Boosts boosts;         // what is in force this tick
+    std::string share_text; // the last exported preset, for the menu to put on the clipboard
+    std::uint64_t share_serial{};
     bool extras_due{true}; // the player's own extras are to be published for a session again
     bool wipeouts_known{}; // the wipeout count the session started with was read
     int open_tab{};
@@ -223,6 +231,50 @@ std::optional<Vec3> read_position(const Json &value) {
     }
     return result;
 }
+// ---- the player's own camera -------------------------------------------------------------------
+struct CameraPreset {
+    std::string_view name, note;
+    bool foot; // it is a framing for walking, not skating
+    CameraSet set;
+};
+constexpr CameraPreset camera_presets[]{
+    {"Low", "Close to the ground behind the board, looking slightly up: the Skate 1 feel.", false, {2.6f, 0.45f, 4.0f, 0.0f, 78.0f, 0.06f}},
+    {"Low plus", "The low camera raised a little, so more of the skater shows.", false, {2.8f, 0.8f, 0.0f, 0.0f, 72.0f, 0.06f}},
+    {"Skate 3", "Close chase camera with a wide lens.", false, {2.3f, 0.9f, -2.0f, 0.0f, 80.0f, 0.1f}},
+    {"High", "Further back and above, for lines and big gaps.", false, {4.8f, 2.6f, -18.0f, 0.0f, 62.0f, 0.1f}},
+    {"Shoulder", "On foot: over the right shoulder.", true, {1.7f, 1.55f, -6.0f, 0.45f, 62.0f, 0.05f}},
+    {"Shoulder left", "On foot: over the left shoulder.", true, {1.7f, 1.55f, -6.0f, -0.45f, 62.0f, 0.05f}},
+};
+float *camera_field(CameraSet &set, std::string_view name) {
+    return name == "distance" ? &set.distance : name == "height" ? &set.height : name == "pitch" ? &set.pitch
+         : name == "side" ? &set.side : name == "fov" ? &set.fov : name == "lag" ? &set.lag : nullptr;
+}
+CameraSet sane_camera(CameraSet set) {
+    const auto finite = [](float value, float low, float high, float otherwise) { return std::isfinite(value) ? std::clamp(value, low, high) : otherwise; };
+    set.distance = finite(set.distance, 0.2f, 30.0f, 3.4f);
+    set.height = finite(set.height, -2.0f, 20.0f, 1.5f);
+    set.pitch = finite(set.pitch, -85.0f, 85.0f, -9.0f);
+    set.side = finite(set.side, -5.0f, 5.0f, 0.0f);
+    set.fov = set.fov < 20.0f ? 0.0f : finite(set.fov, 20.0f, 150.0f, 0.0f);
+    set.lag = finite(set.lag, 0.0f, 2.0f, 0.08f);
+    return set;
+}
+Json write_camera(const CameraSet &set) {
+    Json row = Json::object();
+    row["distance"] = set.distance;
+    row["height"] = set.height;
+    row["pitch"] = set.pitch;
+    row["side"] = set.side;
+    row["fov"] = set.fov;
+    row["lag"] = set.lag;
+    return row;
+}
+CameraSet read_camera(const Json &row, CameraSet set) {
+    if (!row.is_object()) return set;
+    for (const auto name : {"distance", "height", "pitch", "side", "fov", "lag"})
+        if (row.contains(name) && row.at(name).is_number()) *camera_field(set, name) = row.at(name).get<float>();
+    return sane_camera(set);
+}
 Json write_position(const Vec3 &p) { return Json::array({Json(p[0]), Json(p[1]), Json(p[2])}); }
 
 void load_store() {
@@ -235,6 +287,7 @@ void load_store() {
             const auto &o = json->at("options");
             s.auto_return = o.value("auto_return", false);
             s.pad_shortcuts = o.value("pad_shortcuts", false);
+            s.pad_menu = o.value("pad_menu", true);
             s.hud = o.value("hud", false);
             s.hud_jump = o.value("hud_jump", false);
             s.return_delay = std::clamp(o.value("return_delay", 1.5f), 0.0f, 10.0f);
@@ -259,6 +312,25 @@ void load_store() {
         if (json->contains("active") && json->at("active").is_array())
             for (const auto &name : json->at("active"))
                 if (name.is_string()) s.active.push_back(name.string());
+        if (json->contains("camera") && json->at("camera").is_object()) {
+            const auto &camera = json->at("camera");
+            s.camera_on = camera.value("on", false);
+            if (camera.contains("board")) s.camera_board = read_camera(camera.at("board"), s.camera_board);
+            if (camera.contains("foot")) s.camera_foot = read_camera(camera.at("foot"), s.camera_foot);
+            if (camera.contains("rigs") && camera.at("rigs").is_object())
+                for (std::size_t i = 0; i < camera_rigs; ++i) {
+                    const auto *name = i == 0 ? "low" : i == 1 ? "high" : "foot";
+                    if (!camera.at("rigs").contains(name) || !camera.at("rigs").at(name).is_object()) continue;
+                    const auto &row = camera.at("rigs").at(name);
+                    RigSetting rig;
+                    rig.distance = row.value("distance", 1.0f);
+                    rig.height = row.value("height", 0.0f);
+                    rig.raise = row.value("raise", 0.0f);
+                    rig.side = row.value("side", 1.0f);
+                    const auto finite = [](float value, float low, float high, float otherwise) { return std::isfinite(value) ? std::clamp(value, low, high) : otherwise; };
+                    s.rigs[i] = {finite(rig.distance, 0.1f, 10.0f, 1.0f), finite(rig.height, -3.0f, 10.0f, 0.0f), finite(rig.raise, -3.0f, 10.0f, 0.0f), finite(rig.side, -5.0f, 5.0f, 1.0f)};
+                }
+        }
         if (json->contains("maps") && json->at("maps").is_object())
             for (const auto &[level, row] : json->at("maps").items()) {
                 if (!row.is_object()) continue;
@@ -281,6 +353,7 @@ void save_store() {
         Json options = Json::object();
         options["auto_return"] = s.auto_return;
         options["pad_shortcuts"] = s.pad_shortcuts;
+        options["pad_menu"] = s.pad_menu;
         options["hud"] = s.hud;
         options["hud_jump"] = s.hud_jump;
         options["return_delay"] = s.return_delay;
@@ -321,6 +394,21 @@ void save_store() {
             maps[level] = std::move(row);
         }
         json["maps"] = std::move(maps);
+        Json camera = Json::object();
+        camera["on"] = s.camera_on;
+        camera["board"] = write_camera(s.camera_board);
+        camera["foot"] = write_camera(s.camera_foot);
+        Json rigs = Json::object();
+        for (std::size_t i = 0; i < camera_rigs; ++i) {
+            Json row = Json::object();
+            row["distance"] = s.rigs[i].distance;
+            row["height"] = s.rigs[i].height;
+            row["raise"] = s.rigs[i].raise;
+            row["side"] = s.rigs[i].side;
+            rigs[i == 0 ? "low" : i == 1 ? "high" : "foot"] = std::move(row);
+        }
+        camera["rigs"] = std::move(rigs);
+        json["camera"] = std::move(camera);
         const auto directory = data_directory();
         if (directory.empty()) return;
         std::error_code error;
@@ -592,6 +680,7 @@ void adopt(const tuning::Values &live) {
     changed(false);
 }
 std::string apply_preset(std::string_view name);
+void drive_camera(bool playing);
 bool editable(std::string *why = nullptr) {
     // A guest's physics are the host's while the session enforces them: the tuning
     // (physics_tuning::enforce), and what the host shares beyond it (sync_session). Writing
@@ -726,6 +815,11 @@ bool matches(const std::string &key, std::string_view pattern) {
 }
 // What each built-in preset's rules reach in the running game: (entry, rule) pairs, worked out
 // once per table of entries.
+// Whether a preset rule is about this value (`scale`: it is a curve or graph multiplier).
+bool rule_matches(const Entry &e, bool scale, const PresetRule &rule) {
+    if (rule.exact) return !scale && e.key == rule.pattern;
+    return !e.detail && scale == rule.curves && matches(e.key, rule.pattern);
+}
 const std::vector<std::vector<std::pair<std::size_t, std::size_t>>> &preset_targets() {
     static std::vector<std::vector<std::pair<std::size_t, std::size_t>>> cache;
     static const Entry *cached_for{};
@@ -742,7 +836,7 @@ const std::vector<std::vector<std::pair<std::size_t, std::size_t>>> &preset_targ
             for (std::size_t i = 0; i < s.entries.size(); ++i) {
                 const auto &e = s.entries[i];
                 const bool scale = e.kind == Kind::curve || e.kind == Kind::graph;
-                if (e.detail || scale != rule.curves || !matches(e.key, rule.pattern)) continue;
+                if (!rule_matches(e, scale, rule)) continue;
                 if (e.kind == Kind::flag && rule.multiply) continue;
                 cache[p].emplace_back(i, r);
             }
@@ -780,6 +874,22 @@ std::string apply_dial(std::string_view name, double factor) {
     changed();
     return std::format("{} x{:.2f}: {} values set{}.", presets[p].name, factor, count, locked ? std::format("; {} locked values left alone", locked) : "");
 }
+// A preset of the player's own also carries the trick sliders that are off 1, under these keys.
+constexpr std::string_view trick_prefix = "trick.";
+constexpr std::string_view trick_names[]{"flip_speed", "hippy_height", "nocomply_height", "boneless_height", "offboard_height"};
+float *trick_option(std::string_view name) {
+    auto &s = state();
+    return name == "flip_speed" ? &s.flip_speed : name == "hippy_height" ? &s.hippy_height : name == "nocomply_height" ? &s.nocomply_height
+         : name == "boneless_height" ? &s.boneless_height : name == "offboard_height" ? &s.offboard_height : nullptr;
+}
+// Sets a trick slider named by a preset key; false when the key is not one.
+bool set_trick_key(std::string_view key, double value) {
+    if (!key.starts_with(trick_prefix)) return false;
+    const auto name = key.substr(trick_prefix.size());
+    if (auto *option = trick_option(name))
+        *option = name == "flip_speed" ? std::clamp(static_cast<float>(value), flip_low, flip_high) : std::clamp(static_cast<float>(value), height_low, height_high);
+    return true;
+}
 std::string remove_preset(std::string_view name) {
     auto &s = state();
     const auto wanted = lower(name);
@@ -801,8 +911,10 @@ std::string remove_preset(std::string_view name) {
     };
     for (const auto &[user_name, values] : s.user) {
         if (lower(user_name) != wanted) continue;
-        for (const auto &saved : values)
-            if (auto *e = find_entry(saved.first)) put_back(*e);
+        for (const auto &saved : values) {
+            if (set_trick_key(saved.first, 1.0)) ++count;
+            else if (auto *e = find_entry(saved.first)) put_back(*e);
+        }
         removed = user_name;
         break;
     }
@@ -812,7 +924,7 @@ std::string remove_preset(std::string_view name) {
             for (const auto &rule : preset.rules)
                 for (auto &e : s.entries) {
                     const bool scale = e.kind == Kind::curve || e.kind == Kind::graph;
-                    if (e.detail || scale != rule.curves || !matches(e.key, rule.pattern)) continue;
+                    if (!rule_matches(e, scale, rule)) continue;
                     put_back(e);
                 }
             removed = preset.name;
@@ -856,8 +968,10 @@ std::string apply_preset(std::string_view name) {
     if (applied.empty())
         for (const auto &[user_name, values] : s.user) {
             if (lower(user_name) != wanted) continue;
-            for (const auto &[key, value] : values)
-                if (auto *e = find_entry(key); e && !is_locked(*e)) { set_entry(*e, value); ++count; }
+            for (const auto &[key, value] : values) {
+                if (set_trick_key(key, value)) ++count;
+                else if (auto *e = find_entry(key); e && !is_locked(*e)) { set_entry(*e, value); ++count; }
+            }
             applied = user_name;
             break;
         }
@@ -867,7 +981,7 @@ std::string apply_preset(std::string_view name) {
             for (const auto &rule : preset.rules)
                 for (auto &e : s.entries) {
                     const bool scale = e.kind == Kind::curve || e.kind == Kind::graph;
-                    if (e.detail || scale != rule.curves || !matches(e.key, rule.pattern)) continue;
+                    if (!rule_matches(e, scale, rule)) continue;
                     if (e.kind == Kind::flag && rule.multiply) continue;
                     if (is_locked(e)) {
                         ++locked;
@@ -924,6 +1038,7 @@ MapFile read_map_file(const std::string &level) {
 }
 void enter_map(const std::string &level) {
     auto &s = state();
+    forget_camera_rigs();
     s.map = level;
     s.map_file = level.empty() ? MapFile{} : read_map_file(level);
     s.motion = {};
@@ -1313,6 +1428,7 @@ void build_view() {
         const auto friendly = essential_name(e.key, &rank, &modes);
         next->rows.push_back({e.id, e.label, e.group, e.kind, e.value, e.stock, e.touched, e.frozen, e.detail, std::string(friendly), rank, modes,
                               e.used});
+        next->rows.back().help = essential_help(e.key);
         if (e.touched) ++next->touched;
         if (std::ranges::find(next->groups, e.group) == next->groups.end()) next->groups.push_back(e.group);
     }
@@ -1359,6 +1475,7 @@ void build_view() {
     next->boneless_height = s.boneless_height;
     next->return_delay = s.return_delay;
     next->pad_shortcuts = s.pad_shortcuts;
+    next->pad_menu = s.pad_menu;
     next->hud = s.hud;
     next->hud_jump = s.hud_jump;
     next->logging = s.logging;
@@ -1366,13 +1483,150 @@ void build_view() {
     next->map_note = s.map_file.note;
     next->map_preset = s.map_file.preset.empty() ? std::string{} : s.map_file.preset_name.empty() ? "Map preset" : s.map_file.preset_name;
     next->spots = s.map_file.spots;
+    next->rigs = s.rigs;
+    next->rigs_found = camera_rigs_summary();
+    next->camera_on = s.camera_on;
+    next->camera_board = s.camera_board;
+    next->camera_foot = s.camera_foot;
+    if (const auto profile = multiplayer::gameplay_camera_profile(); profile.samples >= 60)
+        next->camera_game = std::format("{:.1f} m behind, {:.1f} m up, tilt {:.0f} degrees, FOV {:.0f}", profile.distance, profile.height, profile.pitch, profile.fov);
     next->open_serial = s.open_serial;
+    next->stock = !s.camera_on && s.rigs == std::array<RigSetting, camera_rigs>{} && !next->touched && s.active.empty() && std::ranges::none_of(s.entries, &Entry::frozen) &&
+                  std::ranges::all_of(trick_names, [](std::string_view name) { return *trick_option(name) == 1.0f; });
+    next->share_text = s.share_text;
+    next->share_serial = s.share_serial;
     next->open_tab = s.open_tab;
     if (const auto found = s.maps.find(s.map); found != s.maps.end()) {
         next->markers = found->second.markers;
         next->profile_preset = found->second.preset;
     }
     publish(std::move(next));
+}
+// ---- sharing presets ---------------------------------------------------------------------------
+// One line of text, short enough to paste in a chat: "RST1:" and the preset's JSON in base64.
+constexpr std::string_view share_tag = "RST1:";
+constexpr std::string_view base64_digits = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+std::string base64(std::string_view bytes) {
+    std::string out;
+    for (std::size_t i = 0; i < bytes.size(); i += 3) {
+        std::uint32_t chunk{};
+        const auto count = std::min<std::size_t>(3, bytes.size() - i);
+        for (std::size_t k = 0; k < 3; ++k) chunk = chunk << 8 | (k < count ? static_cast<unsigned char>(bytes[i + k]) : 0u);
+        for (std::size_t k = 0; k < 4; ++k) out += k <= count ? base64_digits[chunk >> (18 - 6 * k) & 63] : '=';
+    }
+    return out;
+}
+std::optional<std::string> unbase64(std::string_view text) {
+    std::string out;
+    std::uint32_t chunk{};
+    int bits{};
+    for (const char c : text) {
+        if (c == '=' || std::isspace(static_cast<unsigned char>(c))) continue;
+        const auto digit = base64_digits.find(c);
+        if (digit == std::string_view::npos) return std::nullopt;
+        chunk = chunk << 6 | static_cast<std::uint32_t>(digit);
+        if ((bits += 6) >= 8) out += static_cast<char>(chunk >> (bits -= 8) & 0xff);
+    }
+    return out;
+}
+std::filesystem::path shared_directory() {
+    const auto directory = data_directory();
+    return directory.empty() ? directory : directory / L"shared";
+}
+// File names from preset names: letters, digits, space, '-' and '_' only.
+std::string file_stem(std::string_view name) {
+    std::string stem;
+    for (const char c : name) stem += std::isalnum(static_cast<unsigned char>(c)) || c == ' ' || c == '-' || c == '_' ? c : '_';
+    return stem.empty() ? "preset" : stem;
+}
+// `preset export <name>`: one of the player's presets, or "current" for what is changed right now.
+std::string export_preset(const std::string &name) {
+    auto &s = state();
+    Json values = Json::object();
+    std::string title;
+    if (lower(name) == "current") {
+        for (const auto &e : s.entries)
+            if (e.touched) values[e.key] = e.value;
+        for (const auto trick : trick_names)
+            if (const auto *option = trick_option(trick); *option != 1.0f) values[std::string(trick_prefix) + std::string(trick)] = *option;
+        title = "My setup";
+    } else {
+        for (const auto &[user_name, saved] : s.user)
+            if (lower(user_name) == lower(name)) {
+                for (const auto &[key, value] : saved) values[key] = value;
+                title = user_name;
+            }
+        if (title.empty()) return "error: no preset of yours is called \"" + name + "\". Use \"current\" for what is changed right now.";
+    }
+    if (values.empty()) return "error: nothing is changed, so there is nothing to share.";
+    const auto count = values.size();
+    Json json = Json::object();
+    json["reskate_trainer"] = 1;
+    json["name"] = title;
+    json["values"] = std::move(values);
+    s.share_text = std::string(share_tag) + base64(json.dump());
+    ++s.share_serial;
+    std::string where;
+    if (const auto directory = shared_directory(); !directory.empty()) {
+        std::error_code error;
+        std::filesystem::create_directories(directory, error);
+        std::ofstream file(directory / (file_stem(title) + ".json"), std::ios::binary | std::ios::trunc);
+        file << json.dump(2);
+        if (file) where = std::format(" Also saved as shared\\{}.json.", file_stem(title));
+    }
+    changed();
+    return std::format("\"{}\" copied to the clipboard as one line ({} values): paste it anywhere.{}", title, count, where);
+}
+// `preset import [file]`: the text the menu put in shared\clipboard.txt, or a file in shared\.
+// Either the one-line form or the JSON itself. The preset joins the player's own; nothing is applied.
+std::string import_preset(const std::string &file_name) {
+    auto &s = state();
+    const auto directory = shared_directory();
+    if (directory.empty()) return "error: the trainer's folder could not be found.";
+    const auto path = directory / (file_name.empty() ? "clipboard.txt" : file_stem(std::filesystem::path(file_name).stem().string()) + ".json");
+    std::string text;
+    {
+        std::ifstream file(path, std::ios::binary);
+        if (!file) return file_name.empty() ? "error: there is nothing to import." : "error: shared\\" + path.filename().string() + " does not exist.";
+        text.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    }
+    if (text.size() > 256 * 1024) return "error: that is too long to be a preset.";
+    if (const auto tag = text.find(share_tag); tag != std::string::npos) {
+        const auto start = tag + share_tag.size();
+        const auto end = text.find_first_of(" \t\r\n`\"'", start);
+        const auto decoded = unbase64(std::string_view(text).substr(start, end == std::string::npos ? end : end - start));
+        if (!decoded) return "error: that is not a whole preset line: copy all of it, from RST1: to the end.";
+        text = *decoded;
+    }
+    try {
+        const auto json = Json::parse(text);
+        if (!json.is_object() || !json.contains("values") || !json.at("values").is_object()) return "error: that is not a ReSkate Trainer preset.";
+        std::map<std::string, double, std::less<>> values;
+        std::size_t unknown{};
+        for (const auto &[key, value] : json.at("values").items()) {
+            if (!value.is_number() || values.size() >= 512) continue;
+            const auto id = lower(key);
+            const bool trick = id.starts_with(trick_prefix) && trick_option(std::string_view(id).substr(trick_prefix.size()));
+            if (!trick && !find_entry(id)) ++unknown; // kept: another build of the game may have it
+            values[id] = value.get<double>();
+        }
+        if (values.empty()) return "error: that preset holds no values.";
+        auto name = json.value("name", "Imported");
+        if (name.empty() || name.size() > 40) name = "Imported";
+        const auto taken = [&](const std::string &candidate) {
+            if (lower(candidate) == "stock" || lower(candidate) == "map" || s.user.contains(candidate)) return true;
+            return std::ranges::any_of(builtin_presets(), [&](const auto &preset) { return lower(preset.name) == lower(candidate); });
+        };
+        auto unique = name;
+        for (int n = 2; taken(unique); ++n) unique = std::format("{} {}", name, n);
+        const auto count = values.size();
+        s.user[unique] = std::move(values);
+        changed();
+        return std::format("Imported \"{}\" ({} values{}). Turn it on under Your presets.", unique, count,
+                           unknown ? std::format(", {} of them unknown to this version", unknown) : "");
+    } catch (...) {
+        return "error: that is not a ReSkate Trainer preset.";
+    }
 }
 bool flag(const std::string &text, bool &out) {
     const auto value = lower(text);
@@ -1397,6 +1651,7 @@ void tick(std::uintptr_t base, std::uintptr_t client, bool playing, const std::s
         s.base = base;
         sync_session();
         s.boosts = boosts_in_force();
+        drive_camera(playing);
         if (const auto key = lower(playing ? level : std::string{}); key != s.map) enter_map(key);
         if (playing) {
             observe(base, client, now);
@@ -1451,6 +1706,111 @@ void tick(std::uintptr_t base, std::uintptr_t client, bool playing, const std::s
 }
 
 namespace {
+// Every tick: the framing for what the skater is doing, or none.
+void drive_camera(bool playing) {
+    auto &s = state();
+    multiplayer::CustomCamera camera;
+    const auto &set = s.telemetry.physics_state == addr::no_bail::offboard_physics_state ? s.camera_foot : s.camera_board;
+    camera.on = s.camera_on && playing && s.telemetry.skater;
+    camera.position = s.telemetry.position;
+    camera.heading = s.telemetry.heading;
+    camera.distance = set.distance;
+    camera.height = set.height;
+    camera.pitch = set.pitch;
+    camera.side = set.side;
+    camera.fov = set.fov;
+    camera.lag = set.lag;
+    multiplayer::set_custom_camera(camera);
+    want_camera_rigs(s.rigs);
+    if (playing && s.telemetry.skater) (void)apply_camera_rigs(GetTickCount64());
+}
+constexpr std::string_view rig_names[]{"low", "high", "foot"};
+float *rig_field(RigSetting &rig, std::string_view name) {
+    return name == "distance" ? &rig.distance : name == "height" ? &rig.height : name == "raise" ? &rig.raise : name == "side" ? &rig.side : nullptr;
+}
+RigSetting sane_rig(RigSetting rig) {
+    const auto finite = [](float value, float low, float high, float otherwise) { return std::isfinite(value) ? std::clamp(value, low, high) : otherwise; };
+    rig.distance = finite(rig.distance, 0.1f, 10.0f, 1.0f);
+    rig.height = finite(rig.height, -3.0f, 10.0f, 0.0f);
+    rig.raise = finite(rig.raise, -3.0f, 10.0f, 0.0f);
+    rig.side = finite(rig.side, -5.0f, 5.0f, 1.0f);
+    return rig;
+}
+// The game's own cameras: `trainer camera rig low|high|foot <field> <number>`, or a preset for all three.
+std::string rig_command(const std::vector<std::string> &a) {
+    auto &s = state();
+    const auto arg = [&](std::size_t i) { return i < a.size() ? lower(a[i]) : std::string{}; };
+    if (arg(1) == "stock") {
+        s.rigs = {};
+        changed();
+        return "The game's cameras are where the game puts them.";
+    }
+    if (arg(1) == "sunjay") {
+        // SunJay's Low Cam (thunderstore.io/c/reskate/p/SunJayTeam/SunJays_Low_Cam): both on-board
+        // cameras 1.2 m back, 0.4 m lower, turning about a point 0.4 m lower.
+        s.rigs[0] = {1.2f / 1.9f, -0.4f, -0.4f, 1.0f / 1.35f};
+        s.rigs[1] = {1.2f / 3.0f, -0.4f, -0.4f, 1.0f};
+        changed();
+        return "Both on-board cameras set like SunJay's Low Cam.";
+    }
+    if (arg(1) == "low+") {
+        s.rigs[0] = {0.8f, -0.25f, -0.15f, 0.85f};
+        changed();
+        return "Low camera: lower and closer, with more of the skater in view.";
+    }
+    const auto found = std::ranges::find(rig_names, arg(1));
+    auto *field = found != std::end(rig_names) ? rig_field(s.rigs[static_cast<std::size_t>(found - std::begin(rig_names))], arg(2)) : nullptr;
+    const auto value = number(arg(3));
+    if (!field || !value) return "error: usage: trainer camera rig low|high|foot distance|height|raise|side <number>, or camera rig stock|sunjay|low+";
+    *field = static_cast<float>(*value);
+    auto &rig = s.rigs[static_cast<std::size_t>(found - std::begin(rig_names))];
+    rig = sane_rig(rig);
+    changed();
+    return std::format("Camera {} {} = {:.3g}. {}", arg(1), arg(2), *field, camera_rigs_summary());
+}
+// trainer camera on|off | game | preset <name> | set board|foot <field> <number>
+std::string camera_command(const std::vector<std::string> &a) {
+    auto &s = state();
+    const auto arg = [&](std::size_t i) { return i < a.size() ? lower(a[i]) : std::string{}; };
+    const auto action = arg(0);
+    if (action == "rig") return rig_command(a);
+    bool on{};
+    if (flag(action, on)) {
+        s.camera_on = on;
+        changed();
+        return on ? "Your camera is on. It does not avoid walls; switch it off to get the game's back." : "The game's own camera is back.";
+    }
+    if (action == "game") {
+        const auto profile = multiplayer::gameplay_camera_profile();
+        if (profile.samples < 60) return "error: skate for a few seconds with the game's own camera first, so it can be measured.";
+        s.camera_board = sane_camera({profile.distance, profile.height, profile.pitch, 0.0f, 0.0f, 0.1f});
+        changed();
+        return std::format("On board: the game's framing, {:.1f} m behind, {:.1f} m up, tilt {:.0f} degrees.", profile.distance, profile.height, profile.pitch);
+    }
+    if (action == "preset") {
+        std::string name;
+        for (std::size_t i = 1; i < a.size(); ++i) name += (i > 1 ? " " : "") + lower(a[i]);
+        for (const auto &preset : camera_presets)
+            if (lower(preset.name) == name) {
+                (preset.foot ? s.camera_foot : s.camera_board) = preset.set;
+                s.camera_on = true;
+                changed();
+                return std::format("Camera: {} ({}).", preset.name, preset.foot ? "on foot" : "on board");
+            }
+        return "error: no camera preset is called \"" + name + "\".";
+    }
+    if (action == "set") {
+        auto *set = arg(1) == "board" ? &s.camera_board : arg(1) == "foot" ? &s.camera_foot : nullptr;
+        auto *field = set ? camera_field(*set, arg(2)) : nullptr;
+        const auto value = number(arg(3));
+        if (!field || !value) return "error: usage: trainer camera set board|foot distance|height|pitch|side|fov|lag <number>";
+        *field = static_cast<float>(*value);
+        *set = sane_camera(*set);
+        changed();
+        return std::format("Camera {} {} = {:.3g}", arg(1), arg(2), *field);
+    }
+    return "error: usage: trainer camera on|off | game | preset <name> | set board|foot <field> <number>";
+}
 std::string run(std::string_view verb, const std::vector<std::string> &a) {
     auto &s = state();
     const auto v = lower(verb);
@@ -1496,6 +1856,8 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
             }
             s.saved.clear();
             s.active.clear();
+            s.camera_on = false;
+            s.rigs = {};
             s.hippy_height = s.nocomply_height = s.boneless_height = s.offboard_height = s.flip_speed = 1.0f;
             changed();
             return std::format("Everything is the game's own again: {} values put back, locks cleared, presets off, trick sliders at 1.", count);
@@ -1539,7 +1901,9 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
         const auto action = lower(arg(0));
         std::string name;
         for (std::size_t i = 1; i < a.size(); ++i) name += (i > 1 ? " " : "") + a[i];
-        if (name.empty()) return "error: usage: trainer preset apply|remove|save|delete <name>";
+        if (action == "import") return import_preset(name);
+        if (name.empty()) return "error: usage: trainer preset apply|remove|save|delete|export <name>, or preset import [file]";
+        if (action == "export") return export_preset(name);
         if (action == "remove") {
             std::string why;
             if (!editable(&why)) return "error: " + why;
@@ -1558,6 +1922,8 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
             std::map<std::string, double, std::less<>> values;
             for (const auto &e : s.entries)
                 if (e.touched) values[e.key] = e.value;
+            for (const auto trick : trick_names)
+                if (const auto *option = trick_option(trick); *option != 1.0f) values[std::string(trick_prefix) + std::string(trick)] = *option;
             if (values.empty()) return "error: nothing is changed, so there is nothing to save.";
             const auto count = values.size();
             s.user[name] = std::move(values);
@@ -1572,6 +1938,7 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
         }
         return "error: usage: trainer preset apply|save|delete <name>";
     }
+    if (v == "camera") return camera_command(a);
     if (v == "slot") {
         const auto slot = slot_argument(a, 0);
         if (!slot) return std::format("error: slots are 1 to {}.", marker_slots);
@@ -1633,11 +2000,12 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
             if (!value) return "error: return_delay needs seconds.";
             s.return_delay = std::clamp(static_cast<float>(*value), 0.0f, 10.0f);
         } else if (!flag(arg(1), on)) {
-            return "error: usage: trainer option hud|hud_jump|auto_return|pad|log 0|1";
+            return "error: usage: trainer option hud|hud_jump|auto_return|pad|pad_menu|log 0|1";
         } else if (name == "hud") s.hud = on;
         else if (name == "hud_jump") s.hud_jump = on;
         else if (name == "auto_return") s.auto_return = on;
         else if (name == "pad") s.pad_shortcuts = on;
+        else if (name == "pad_menu") s.pad_menu = on;
         else if (name == "log") {
             set_logging(on);
             if (on && !s.logging) return "error: the telemetry file could not be created.";
@@ -1663,9 +2031,9 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
     if (v == "open") {
         const auto tab = lower(arg(0));
         // The last three are the Tune tab on one of its lists.
-        const std::array<std::string_view, 7> tabs{"tune", "presets", "practice", "map", "realistic", "fun", "everything"};
+        const std::array<std::string_view, 8> tabs{"tune", "presets", "practice", "map", "realistic", "fun", "everything", "camera"};
         const auto found = std::ranges::find(tabs, tab);
-        if (!tab.empty() && found == tabs.end()) return "error: usage: trainer open [tune|presets|practice|map|realistic|fun|everything]";
+        if (!tab.empty() && found == tabs.end()) return "error: usage: trainer open [tune|presets|practice|camera|map|realistic|fun|everything]";
         s.open_tab = tab.empty() ? 1 : static_cast<int>(found - tabs.begin());
         ++s.open_serial;
         s.view_due = true;
@@ -1719,6 +2087,19 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
 }
 } // namespace
 
+bool stage_import(std::string_view text) noexcept {
+    try {
+        const auto directory = shared_directory();
+        if (directory.empty() || text.empty() || text.size() > 256 * 1024) return false;
+        std::error_code error;
+        std::filesystem::create_directories(directory, error);
+        std::ofstream file(directory / "clipboard.txt", std::ios::binary | std::ios::trunc);
+        file << text;
+        return static_cast<bool>(file);
+    } catch (...) {
+        return false;
+    }
+}
 std::string command(std::string_view verb, const std::vector<std::string> &arguments) {
     auto result = run(verb, arguments);
     // The menu shows the last answer, except for the ones a dragged slider sends every frame.

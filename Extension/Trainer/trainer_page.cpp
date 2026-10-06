@@ -33,9 +33,11 @@ struct Page {
     float hippy_edit{1}, nocomply_edit{1}, boneless_edit{1}, offboard_edit{1}, flip_edit{1};
     bool hippy_editing{}, nocomply_editing{}, boneless_editing{}, offboard_editing{}, flip_editing{};
     std::uint64_t open_serial{}; // the last `trainer open` acted on
+    std::uint64_t share_serial{}; // the last `preset export` put on the clipboard
+    bool share_seen{};
     bool show_page{};
 };
-void trick_heights(SkateMenu &menu, const CallbacksV3 &callbacks, Page &p, const trainer::View &view);
+void trick_heights(SkateMenu &menu, const CallbacksV3 &callbacks, Page &p, const trainer::View &view, const std::string &words);
 Page &page() {
     static auto *value = new Page;
     return *value;
@@ -70,19 +72,19 @@ void filter_rows(Page &p, const trainer::View &view) {
     p.hidden_unused = 0;
     const std::string *group = p.mode == 2 && p.group > 1 && static_cast<std::size_t>(p.group) <= view.groups.size() + 1
         ? &view.groups[static_cast<std::size_t>(p.group) - 2] : nullptr;
-    const bool essentials = p.mode < 2;
+    const bool essentials = p.mode < 2 && words.empty(); // searching looks through every value, whatever the list
     const std::uint8_t list = p.mode == 0 ? trainer::mode_realistic : trainer::mode_fun;
     for (std::size_t i = 0; i < view.rows.size(); ++i) {
         const auto &row = view.rows[i];
         if (essentials) {
             // Only what the game was found or seen to read: a short list has no room for maybes.
-            if (!row.friendly.empty() && (row.modes & list) && row.used) p.shown.push_back(i);
+            if (!row.friendly.empty() && (row.modes & list) && (row.used || (row.modes & trainer::mode_trial))) p.shown.push_back(i);
             continue;
         }
         if (row.detail && !p.graph_points && !row.touched) continue;
         if (p.only_changed && !row.touched && !row.frozen) continue;
         // Searching looks through every group.
-        if (words.empty() || p.mode < 2 ? (group && row.group != *group) : !contains_words(lower(row.id + " " + row.label + " " + row.friendly), words))
+        if (words.empty() ? (group && row.group != *group) : !contains_words(lower(row.id + " " + row.label + " " + row.friendly), words))
             continue;
         // A value nothing in the game reads would be a slider that does nothing.
         if (!row.used && !p.show_unused && !row.touched && !row.frozen) {
@@ -109,7 +111,7 @@ void value_row(SkateMenu &menu, const CallbacksV3 &callbacks, Page &p, const tra
     ImGui::TextUnformatted(row.used ? label.c_str() : (label + "  (no use found)").c_str());
     if (tinted) ImGui::PopStyleColor();
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("%s\nStock: %s%s", row.id.c_str(), number(row.stock).c_str(),
+        ImGui::SetTooltip("%s%s%s\nStock: %s%s", row.help.c_str(), row.help.empty() ? "" : "\n", row.id.c_str(), number(row.stock).c_str(),
             row.used ? "" : "\nThe game was not found (or seen) reading this value, so changing it may do nothing.");
     ImGui::SameLine(column);
     const float reset = ImGui::CalcTextSize("Reset").x + ImGui::GetStyle().FramePadding.x * 2;
@@ -229,16 +231,24 @@ void tune_tab(SkateMenu &menu, const Model &model, const CallbacksV3 &callbacks,
     }
     const std::uint8_t list = p.mode == 0 ? trainer::mode_realistic : p.mode == 1 ? trainer::mode_fun : std::uint8_t{0xff};
     const bool can_edit = view.editable && callbacks.queue_console_command != nullptr;
+    // One search for the whole tab: dials, switches, trick sliders and every value.
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+    ImGui::InputTextWithHint("##search", "Search: dials, tricks and every value...", p.search.data(), p.search.size());
+    const auto words = lower(p.search.data());
+    const bool searching = !words.empty();
+    const auto listed = [&](const trainer::PresetRow &preset) {
+        return searching ? contains_words(lower(preset.title + " " + preset.name + " " + preset.note), words) : p.mode == 2 || (preset.modes & list) != 0;
+    };
 
     begin_card(menu, "dials", p.mode == 0 ? "FEEL: TONE IT DOWN" : p.mode == 1 ? "FEEL: TURN IT UP" : "FEEL",
                "1 is the game's own. A dial moves every value its preset moves.");
     ImGui::BeginDisabled(!can_edit);
     for (const auto &preset : view.presets)
-        if (preset.builtin && preset.dial && (p.mode == 2 || (preset.modes & list))) dial_row(menu, callbacks, p, preset);
+        if (preset.builtin && preset.dial && listed(preset)) dial_row(menu, callbacks, p, preset);
     // The presets that are plain switches, and the ones that set several dials at once.
     bool first = true;
     for (const auto &preset : view.presets) {
-        if (!preset.builtin || preset.dial || preset.name == "Stock" || !(p.mode == 2 || (preset.modes & list))) continue;
+        if (!preset.builtin || preset.dial || preset.name == "Stock" || !listed(preset)) continue;
         if (!first && ImGui::GetItemRectMax().x + ImGui::CalcTextSize(preset.name.c_str()).x + ImGui::GetStyle().FramePadding.x * 4 <
                           ImGui::GetWindowPos().x + ImGui::GetContentRegionMax().x)
             ImGui::SameLine();
@@ -264,10 +274,10 @@ void tune_tab(SkateMenu &menu, const Model &model, const CallbacksV3 &callbacks,
     end_card();
 
     ImGui::BeginDisabled(!can_edit);
-    trick_heights(menu, callbacks, p, view);
+    trick_heights(menu, callbacks, p, view, words);
     ImGui::EndDisabled();
 
-    if (p.mode == 2) {
+    if (p.mode == 2 && !searching) {
         begin_card(menu, "preset-save", "YOUR PRESETS", "Save what is changed right now");
         ImGui::BeginDisabled(!can_edit);
         const float button = ImGui::CalcTextSize("Turn off").x + ImGui::GetStyle().FramePadding.x * 2;
@@ -286,8 +296,11 @@ void tune_tab(SkateMenu &menu, const Model &model, const CallbacksV3 &callbacks,
             ImGui::TextUnformatted(preset.name.c_str());
             ImGui::SameLine();
             ImGui::TextDisabled("%s", preset.note.c_str());
-            ImGui::SameLine(ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() - px(120));
+            ImGui::SameLine(ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() - px(170));
             if (ImGui::SmallButton("This map")) trainer_command(menu, callbacks, "profile set " + preset.name);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Share")) trainer_command(menu, callbacks, "preset export " + preset.name);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copies this preset to the clipboard as one line of text. Paste it in a chat;\nanyone with the trainer can import it.");
             ImGui::SameLine();
             if (ImGui::SmallButton("Delete")) trainer_command(menu, callbacks, "preset delete " + preset.name);
             ImGui::PopID();
@@ -301,6 +314,18 @@ void tune_tab(SkateMenu &menu, const Model &model, const CallbacksV3 &callbacks,
         ImGui::BeginDisabled(!p.preset_name[0] || !view.touched);
         if (ImGui::Button("Save", ImVec2(save, 0))) trainer_command(menu, callbacks, std::string("preset save ") + p.preset_name.data());
         ImGui::EndDisabled();
+        // Sharing: a preset travels as one line of text on the clipboard.
+        ImGui::BeginDisabled(view.stock);
+        if (ImGui::Button("Share what is changed now")) trainer_command(menu, callbacks, "preset export current");
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Copies your current setup to the clipboard as one line of text.");
+        ImGui::SameLine();
+        if (ImGui::Button("Import from clipboard")) {
+            const char *text = ImGui::GetClipboardText();
+            if (text && trainer::stage_import(text)) trainer_command(menu, callbacks, "preset import");
+            else feedback(menu, "The clipboard holds no text.");
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copy a preset line someone shared (it starts with RST1:), then press this.\nIt is added to your presets; nothing changes until you turn it on.");
         if (!view.map.empty()) {
             info(menu, "This map applies", view.profile_preset.empty() ? "nothing" : view.profile_preset);
             if (!view.profile_preset.empty() && ImGui::Button("Stop applying it on this map")) trainer_command(menu, callbacks, "profile clear");
@@ -316,9 +341,6 @@ void tune_tab(SkateMenu &menu, const Model &model, const CallbacksV3 &callbacks,
         // The list includes the game's tuning classes, which the trainer has to find in memory
         // before an edit to one does anything: with the list open, it looks now.
         trainer::note_class_list_shown();
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.42f);
-        ImGui::InputTextWithHint("##search", "Search every value...", p.search.data(), p.search.size());
-        ImGui::SameLine();
         ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.42f);
         if (p.group < 1) p.group = 1;
         const char *current = p.group > 1 && static_cast<std::size_t>(p.group) <= view.groups.size() + 1
@@ -337,16 +359,19 @@ void tune_tab(SkateMenu &menu, const Model &model, const CallbacksV3 &callbacks,
         ImGui::Checkbox("Values with no use found", &p.show_unused);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Also list the tuning values that the game was never found or seen reading.\nChanging those will probably do nothing.");
+    } else if (searching) {
+        trainer::note_class_list_shown();
     } else {
         note("The same values the dials move, one at a time. The box on the left locks a value against presets, dials and Reset values.");
     }
     filter_rows(p, view);
+    if (p.mode != 2 && searching) ImGui::TextDisabled("%zu values match", p.shown.size());
     if (p.mode == 2) {
         ImGui::SameLine();
         if (p.hidden_unused) ImGui::TextDisabled("%zu shown, %zu changed, %zu hidden", p.shown.size(), view.touched, p.hidden_unused);
         else ImGui::TextDisabled("%zu shown, %zu changed", p.shown.size(), view.touched);
     }
-    const bool with_group = p.mode == 2 && (p.search[0] != 0 || p.group <= 1 || p.only_changed);
+    const bool with_group = searching || (p.mode == 2 && (p.group <= 1 || p.only_changed));
     const bool friendly = p.mode < 2;
     ImGuiListClipper clipper;
     clipper.Begin(static_cast<int>(p.shown.size()));
@@ -356,10 +381,14 @@ void tune_tab(SkateMenu &menu, const Model &model, const CallbacksV3 &callbacks,
     if (p.shown.empty()) note("Nothing matches.");
 }
 
-void trick_heights(SkateMenu &menu, const CallbacksV3 &callbacks, Page &p, const trainer::View &view) {
+void trick_heights(SkateMenu &menu, const CallbacksV3 &callbacks, Page &p, const trainer::View &view, const std::string &words) {
+    static constexpr const char *labels[]{"Flip trick speed", "No comply height", "Boneless height", "Hippy jump height", "Off-board jump height"};
+    const auto wanted = [&](const char *label) { return words.empty() || contains_words(lower(std::string(label) + " tricks"), words); };
+    if (std::ranges::none_of(labels, wanted)) return;
     begin_card(menu, "trick-heights", "TRICKS", "1.0 is the game's own");
     // `limited`: the game itself stops at the slider's end, so a typed number is held to it too.
     const auto slider = [&](const char *label, const char *option, float value, float &edit, bool &editing, float high = 50.0f, bool limited = false) {
+        if (!wanted(label)) return false;
         field(menu, label);
         ImGui::PushID(option);
         float shown = editing ? edit : value;
@@ -381,9 +410,9 @@ void trick_heights(SkateMenu &menu, const CallbacksV3 &callbacks, Page &p, const
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(limited ? "Type a multiplier and press Enter." : "Type any multiplier and press Enter: the slider's end is not a limit.");
         ImGui::PopID();
+        return true;
     };
-    slider("Flip trick speed", "flip_speed", view.flip_speed, p.flip_edit, p.flip_editing, 3.0f, true);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Slows board flips. Above 1 the game's own limit on how fast a board turns takes over.");
+    if (slider("Flip trick speed", "flip_speed", view.flip_speed, p.flip_edit, p.flip_editing, 3.0f, true) && ImGui::IsItemHovered()) ImGui::SetTooltip("Slows board flips. Above 1 the game's own limit on how fast a board turns takes over.");
     slider("No comply height", "nocomply_height", view.nocomply_height, p.nocomply_edit, p.nocomply_editing);
     slider("Boneless height", "boneless_height", view.boneless_height, p.boneless_edit, p.boneless_editing);
     slider("Hippy jump height", "hippy_height", view.hippy_height, p.hippy_edit, p.hippy_editing);
@@ -467,6 +496,10 @@ void practice_tab(SkateMenu &menu, const Model &model, const CallbacksV3 &callba
     bool pad = view.pad_shortcuts;
     if (toggle_row(menu, "Controller shortcuts", "Hold LB + RB, then D-pad: up saves, down goes, left / right pick the slot.", pad))
         trainer_command(menu, callbacks, std::format("option pad {}", pad ? 1 : 0));
+    bool pad_menu = view.pad_menu;
+    if (toggle_row(menu, "Open this menu from the controller",
+            "LB + RB + click the right stick opens and closes the menu. Inside: D-pad or left stick moves, A presses, B goes back, LB / RB change a slider in big steps.", pad_menu))
+        trainer_command(menu, callbacks, std::format("option pad_menu {}", pad_menu ? 1 : 0));
     end_card();
 
     begin_card(menu, "teleport", "TELEPORT");
@@ -498,6 +531,97 @@ void jump_lines(SkateMenu &menu, const trainer::Jump &jump) {
                                       jump.landing[2]));
     info(menu, "Rotation", std::format("spin {:.0f} degrees (peak {:.0f} per second), flip {:.0f} degrees", jump.spin, jump.spin_rate, jump.flip));
 }
+// The player's own follow camera, in place of the game's: one framing on the board, one on foot.
+void camera_tab(SkateMenu &menu, const CallbacksV3 &callbacks, Page &p, const trainer::View &view) {
+    begin_card(menu, "rigs", "THE GAME'S CAMERAS", "Move the game's own cameras: they keep their smoothing and stay out of walls");
+    if (ImGui::Button("SunJay's Low Cam")) trainer_command(menu, callbacks, "camera rig sunjay");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Both on-board cameras low and close, the numbers of SunJay's Low Cam mod.");
+    ImGui::SameLine();
+    if (ImGui::Button("Low, a little higher")) trainer_command(menu, callbacks, "camera rig low+");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("The low camera lower and closer, but with more of the skater in view.");
+    ImGui::SameLine();
+    if (ImGui::Button("The game's own")) trainer_command(menu, callbacks, "camera rig stock");
+    static constexpr const char *rig_ids[]{"low", "high", "foot"};
+    static constexpr const char *rig_titles[]{"Low camera (on board)", "High camera (on board)", "On foot"};
+    for (std::size_t i = 0; i < trainer::camera_rigs; ++i) {
+        ImGui::SeparatorText(rig_titles[i]);
+        const auto &rig = view.rigs[i];
+        const auto slider = [&](const char *label, const char *field, float value, float low, float high, const char *format, const char *tip) {
+            ImGui::PushID(static_cast<int>(i));
+            ImGui::PushID(field);
+            menu::field(menu, label);
+            const auto key = std::string("rig:") + rig_ids[i] + field;
+            float shown = p.active == key ? static_cast<float>(p.active_value) : value;
+            if (ImGui::SliderFloat("##value", &shown, low, high, format)) trainer_command(menu, callbacks, std::format("camera rig {} {} {:.3f}", rig_ids[i], field, shown));
+            if (ImGui::IsItemActive()) {
+                p.active = key;
+                p.active_value = shown;
+            } else if (p.active == key) {
+                p.active.clear();
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s\nCtrl + click to type a number.", tip);
+            ImGui::PopID();
+            ImGui::PopID();
+        };
+        slider("Distance", "distance", rig.distance, 0.3f, 3.0f, "x %.2f", "How far behind you the camera sits. 1 is the game's own.");
+        slider("Height", "height", rig.height, -1.0f, 2.0f, "%+.2f m", "Moves the camera and the point it looks at up or down together.");
+        slider("Camera only", "raise", rig.raise, -1.0f, 2.0f, "%+.2f m", "Moves the camera alone, so it looks more down at you (or up from below).");
+        if (i == 2) slider("Shoulder", "side", rig.side, 0.0f, 2.0f, "%.2f", "Over the shoulder: 1 is the game's own (centred), above 1 moves right, below 1 moves left, by that many metres.");
+        else slider("Side", "side", rig.side, -2.0f, 2.0f, "x %.2f", "The camera's sideways offset. 1 is the game's own, 0 is dead centre, negative is the other shoulder.");
+    }
+    note(("Found: " + view.rigs_found + ". A change shows at once, or the next time that camera starts.").c_str());
+    end_card();
+    begin_card(menu, "camera", "A CAMERA OF YOUR OWN (EXPERIMENTAL)", "Replaces the game's camera altogether");
+    bool on = view.camera_on;
+    if (toggle_row(menu, "Use my camera", "Replaces the game's camera with the one set below. It stays behind the way you travel and does not avoid walls.", on))
+        trainer_command(menu, callbacks, std::format("camera {}", on ? "on" : "off"));
+    static constexpr const char *presets[]{"Low", "Low plus", "Skate 3", "High", "Shoulder", "Shoulder left"};
+    static constexpr const char *notes[]{
+        "Close to the ground behind the board, looking slightly up: the Skate 1 feel.", "The low camera raised a little, so more of the skater shows.",
+        "Close chase camera with a wide lens.", "Further back and above, for lines and big gaps.",
+        "On foot: over the right shoulder.", "On foot: over the left shoulder."};
+    for (std::size_t i = 0; i < std::size(presets); ++i) {
+        if (i) ImGui::SameLine();
+        if (ImGui::Button(presets[i])) trainer_command(menu, callbacks, std::string("camera preset ") + presets[i]);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", notes[i]);
+    }
+    if (view.camera_game.empty()) note("Skate a few seconds with the game's own camera and its framing is measured here.");
+    else {
+        info(menu, "The game frames you from", view.camera_game);
+        if (ImGui::Button("Start from the game's framing")) trainer_command(menu, callbacks, "camera game");
+    }
+    end_card();
+    const auto set_card = [&](const char *id, const char *title, const char *which, const trainer::CameraSet &set) {
+        begin_card(menu, id, title);
+        const auto slider = [&](const char *label, const char *field, float value, float low, float high, const char *format, const char *tip) {
+            ImGui::PushID(field);
+            ImGui::PushID(which);
+            menu::field(menu, label);
+            const auto key = std::string("camera:") + which + field;
+            float shown = p.active == key ? static_cast<float>(p.active_value) : value;
+            if (ImGui::SliderFloat("##value", &shown, low, high, format)) trainer_command(menu, callbacks, std::format("camera set {} {} {:.3f}", which, field, shown));
+            if (ImGui::IsItemActive()) {
+                p.active = key;
+                p.active_value = shown;
+            } else if (p.active == key) {
+                p.active.clear();
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s\nCtrl + click to type a number.", tip);
+            ImGui::PopID();
+            ImGui::PopID();
+        };
+        slider("Distance", "distance", set.distance, 0.5f, 10.0f, "%.2f m", "How far behind the skater the camera sits.");
+        slider("Height", "height", set.height, -0.5f, 5.0f, "%.2f m", "How far above the skater's feet. Low numbers give the classic low camera.");
+        slider("Tilt", "pitch", set.pitch, -60.0f, 30.0f, "%.0f deg", "Negative looks down at the skater, positive looks up.");
+        slider("Shoulder", "side", set.side, -1.5f, 1.5f, "%.2f m", "Sideways offset: positive is over the right shoulder.");
+        slider("Field of view", "fov", set.fov, 0.0f, 120.0f, set.fov < 20.0f ? "the game's" : "%.0f deg", "How wide the lens is. All the way left keeps the game's own.");
+        slider("Follow lag", "lag", set.lag, 0.0f, 0.5f, "%.2f s", "How far the camera trails behind your movement. 0 is rigid.");
+        end_card();
+    };
+    set_card("camera-board", "ON THE BOARD", "board", view.camera_board);
+    set_card("camera-foot", "ON FOOT", "foot", view.camera_foot);
+}
+
 void map_tab(SkateMenu &menu, const CallbacksV3 &callbacks, const trainer::View &view) {
     const auto telemetry = trainer::telemetry();
     begin_card(menu, "hud", "HUD");
@@ -560,8 +684,8 @@ bool trainer_take_open() {
     if (view->open_serial == p.open_serial) return false;
     p.open_serial = view->open_serial;
     // `trainer open` still takes "presets": they live on the Tune tab now.
-    p.tab = view->open_tab >= 4 ? 0 : std::clamp(view->open_tab - 1, 0, 2);
-    if (view->open_tab >= 4) p.mode = std::clamp(view->open_tab - 4, 0, 2);
+    p.tab = view->open_tab == 7 ? 2 : view->open_tab >= 4 ? 0 : view->open_tab == 3 ? 3 : std::clamp(view->open_tab - 1, 0, 1); // 3 was "map" before the Camera tab
+    if (view->open_tab >= 4 && view->open_tab < 7) p.mode = std::clamp(view->open_tab - 4, 0, 2);
     p.show_page = true;
     return true;
 }
@@ -582,13 +706,24 @@ void trainer_page(SkateMenu &menu, const Model &model, const CallbacksV3 &callba
     ImGui::EndDisabled();
     ImGui::SameLine();
     ImGui::AlignTextToFramePadding();
-    ImGui::TextDisabled("The game as it shipped: every value, lock, preset and trick slider.");
-    category_tabs(menu, p.tab, {"TUNE", "PRACTICE", "MAP & HUD"}, "trainer-tabs");
+    if (view->ready && view->stock) ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1.0f), "STOCK: the game is exactly as it shipped. Nothing of the trainer's is on.");
+    else if (view->ready) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "MODIFIED: this button puts back every value, lock, preset and trick slider.");
+    else ImGui::TextDisabled("The game as it shipped: every value, lock, preset and trick slider.");
+    // `preset export` leaves its line here; the clipboard belongs to this thread.
+    if (!p.share_seen) {
+        p.share_seen = true;
+        p.share_serial = view->share_serial;
+    } else if (p.share_serial != view->share_serial) {
+        p.share_serial = view->share_serial;
+        ImGui::SetClipboardText(view->share_text.c_str());
+    }
+    category_tabs(menu, p.tab, {"TUNE", "PRACTICE", "CAMERA", "MAP & HUD"}, "trainer-tabs");
     ImGui::PushID(p.tab);
     ImGui::BeginChild("trainer-tab", ImVec2(0, page_body_height(menu)));
     switch (p.tab) {
     case 0: tune_tab(menu, model, callbacks, p, *view); break;
     case 1: practice_tab(menu, model, callbacks, p, *view); break;
+    case 2: camera_tab(menu, callbacks, p, *view); break;
     default: map_tab(menu, callbacks, *view); break;
     }
     ImGui::EndChild();
@@ -598,6 +733,15 @@ void trainer_page(SkateMenu &menu, const Model &model, const CallbacksV3 &callba
 
 namespace dingosdk::overlay {
 bool trainer_open_requested() { return menu::trainer_take_open(); }
+bool trainer_pad_menu_pressed(bool menu_visible) {
+    static ControllerComboLatch latch;
+    ControllerInput input;
+    DingoSDKOverlayReadControllerInput(&input, true);
+    constexpr std::uint32_t combo = 0x100 | 0x200 | 0x80; // LB + RB + R3
+    if (!latch.update(combo, input, !trainer::view()->pad_menu)) return false;
+    if (!menu_visible) menu::page().show_page = true;
+    return true;
+}
 bool trainer_hud_pending() {
     const auto view = trainer::view();
     return (view->hud || view->hud_jump) && trainer::telemetry().skater;
