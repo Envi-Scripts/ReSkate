@@ -126,6 +126,7 @@ struct State {
     float offboard_height{1};
     // Board flip tricks: a multiplier on the game's flip speed curves (trainer_classes.h).
     float flip_speed{1};
+    bool flip_gate{true}; // false: the game's finish-before-landing rule for flip tricks is held off
     bool offboard_grounded{}; // off the board and not moving up or down at the last tick
     const char *boost_name{""};
     // The no comply and the boneless are launched by the trick scripts too (trainer_jump.cpp).
@@ -322,6 +323,7 @@ void load_store() {
             s.nocomply_height = std::clamp(o.value("nocomply_height", 1.0f), height_low, height_high);
             s.offboard_height = std::clamp(o.value("offboard_height", 1.0f), height_low, height_high);
             s.flip_speed = std::clamp(o.value("flip_speed", 1.0f), flip_low, flip_high);
+            s.flip_gate = o.value("flip_gate", true);
             s.boneless_height = std::clamp(o.value("boneless_height", 1.0f), height_low, height_high);
             s.revert_boost = std::clamp(o.value("revert_boost", 0.0f), 0.0f, revert_boost_high);
             s.slot = std::clamp(o.value("slot", 0), 0, static_cast<int>(marker_slots) - 1);
@@ -395,6 +397,7 @@ void save_store() {
         options["nocomply_height"] = s.nocomply_height;
         options["offboard_height"] = s.offboard_height;
         options["flip_speed"] = s.flip_speed;
+        options["flip_gate"] = s.flip_gate;
         options["boneless_height"] = s.boneless_height;
         options["revert_boost"] = s.revert_boost;
         options["slot"] = s.slot;
@@ -927,6 +930,7 @@ std::string apply_dial(std::string_view name, double factor) {
 constexpr std::string_view trick_prefix = "trick.";
 constexpr std::string_view trick_names[]{"flip_speed", "hippy_height", "nocomply_height", "boneless_height", "offboard_height", "revert_boost"};
 // What a trick slider is when the game is left alone: the multipliers 1, the revert boost off.
+constexpr std::string_view flip_gate_name = "flip_gate";
 constexpr float trick_stock(std::string_view name) { return name == "revert_boost" ? 0.0f : 1.0f; }
 float *trick_option(std::string_view name) {
     auto &s = state();
@@ -938,6 +942,8 @@ float *trick_option(std::string_view name) {
 bool set_trick_key(std::string_view key, double value) {
     if (!key.starts_with(trick_prefix)) return false;
     const auto name = key.substr(trick_prefix.size());
+    // The slow-flip switch rides along as a number: 0 holds the game's finish-before-landing rule off.
+    if (name == flip_gate_name) state().flip_gate = value != 0;
     if (auto *option = trick_option(name))
         *option = name == "flip_speed" ? std::clamp(static_cast<float>(value), flip_low, flip_high)
                 : name == "revert_boost" ? std::clamp(static_cast<float>(value), 0.0f, revert_boost_high)
@@ -1529,6 +1535,8 @@ void build_view() {
     next->nocomply_height = s.nocomply_height;
     next->offboard_height = s.offboard_height;
     next->flip_speed = s.flip_speed;
+    next->flip_gate = s.flip_gate;
+    next->flip_gate_found = flip_gates() != 0;
     next->boneless_height = s.boneless_height;
     next->revert_boost = s.revert_boost;
     next->revert = s.revert;
@@ -1551,7 +1559,7 @@ void build_view() {
         next->camera_game = std::format("{:.1f} m behind, {:.1f} m up, tilt {:.0f} degrees, FOV {:.0f}", profile.distance, profile.height, profile.pitch, profile.fov);
     next->open_serial = s.open_serial;
     next->stock = s.revert == RevertTuning{} && !s.camera_on && s.rigs == std::array<RigSetting, camera_rigs>{} && !next->touched && s.active.empty() && std::ranges::none_of(s.entries, &Entry::frozen) &&
-                  std::ranges::all_of(trick_names, [](std::string_view name) { return *trick_option(name) == trick_stock(name); });
+                  std::ranges::all_of(trick_names, [](std::string_view name) { return *trick_option(name) == trick_stock(name); }) && s.flip_gate;
     next->share_text = s.share_text;
     next->share_serial = s.share_serial;
     next->open_tab = s.open_tab;
@@ -1608,6 +1616,7 @@ std::string export_preset(const std::string &name) {
             if (e.touched) values[e.key] = e.value;
         for (const auto trick : trick_names)
             if (const auto *option = trick_option(trick); *option != trick_stock(trick)) values[std::string(trick_prefix) + std::string(trick)] = *option;
+        if (!s.flip_gate) values[std::string(trick_prefix) + std::string(flip_gate_name)] = 0;
         title = "My setup";
     } else {
         for (const auto &[user_name, saved] : s.user)
@@ -1665,7 +1674,8 @@ std::string import_preset(const std::string &file_name) {
         for (const auto &[key, value] : json.at("values").items()) {
             if (!value.is_number() || values.size() >= 512) continue;
             const auto id = lower(key);
-            const bool trick = id.starts_with(trick_prefix) && trick_option(std::string_view(id).substr(trick_prefix.size()));
+            const bool trick = id.starts_with(trick_prefix) && (trick_option(std::string_view(id).substr(trick_prefix.size())) ||
+                                                                std::string_view(id).substr(trick_prefix.size()) == flip_gate_name);
             if (!trick && !find_entry(id)) ++unknown; // kept: another build of the game may have it
             values[id] = value.get<double>();
         }
@@ -1745,6 +1755,9 @@ void tick(std::uintptr_t base, std::uintptr_t client, bool playing, const std::s
             }
         }
         want_flip_speed(s.boosts.flip);
+        // The player's own choice, and only where their own trick settings count: not under a
+        // host's enforced physics or in a session that has turned boosts off.
+        want_flip_gate(s.flip_gate || s.enforced || (multiplayer_session_active() && !session_boosts_allowed()));
         if (s.boosts.flip != s.flip_applied) {
             // The catch times follow the flip speed (want_class).
             s.flip_applied = s.boosts.flip;
@@ -1978,6 +1991,7 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
         }
         if (v == "reset" && lower(arg(0)) == "tricks") {
             s.hippy_height = s.nocomply_height = s.boneless_height = s.offboard_height = s.flip_speed = 1.0f;
+            s.flip_gate = true;
             s.revert_boost = 0.0f;
             changed();
             return "Trick heights and flip trick speed are the game's own again.";
@@ -2006,6 +2020,7 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
             s.camera_on = false;
             s.rigs = {};
             s.hippy_height = s.nocomply_height = s.boneless_height = s.offboard_height = s.flip_speed = 1.0f;
+            s.flip_gate = true;
             s.revert_boost = 0.0f;
             s.revert = {};
             changed();
@@ -2073,6 +2088,7 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
                 if (e.touched) values[e.key] = e.value;
             for (const auto trick : trick_names)
                 if (const auto *option = trick_option(trick); *option != trick_stock(trick)) values[std::string(trick_prefix) + std::string(trick)] = *option;
+        if (!s.flip_gate) values[std::string(trick_prefix) + std::string(flip_gate_name)] = 0;
             if (values.empty()) return "error: nothing is changed, so there is nothing to save.";
             const auto count = values.size();
             s.user[name] = std::move(values);
@@ -2157,12 +2173,16 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
             if (!value) return "error: return_delay needs seconds.";
             s.return_delay = std::clamp(static_cast<float>(*value), 0.0f, 10.0f);
         } else if (!flag(arg(1), on)) {
-            return "error: usage: trainer option hud|hud_jump|auto_return|pad|pad_menu|log 0|1";
+            return "error: usage: trainer option hud|hud_jump|auto_return|pad|pad_menu|flip_gate|log 0|1";
         } else if (name == "hud") s.hud = on;
         else if (name == "hud_jump") s.hud_jump = on;
         else if (name == "auto_return") s.auto_return = on;
         else if (name == "pad") s.pad_shortcuts = on;
         else if (name == "pad_menu") s.pad_menu = on;
+        else if (name == "flip_gate") {
+            if (!on && !editable(&why)) return "error: " + why;
+            s.flip_gate = on;
+        }
         else if (name == "log") {
             set_logging(on);
             if (on && !s.logging) return "error: the telemetry file could not be created.";

@@ -53,6 +53,12 @@ std::string classes_summary();
 void want_flip_speed(float factor) noexcept;
 // How many flip trick speed curves were found (0: the multiplier does nothing yet).
 std::size_t flip_curves() noexcept;
+// The game hurries a flip trick so that it is round 1/6 s before the landing it predicts, however
+// slow the flip speed is set. `kept` false holds that rule off: the board turns as slowly as set
+// and lands however far round it got. The search finds the rule's number; flip_gates says whether
+// it did (0: nothing to switch yet).
+void want_flip_gate(bool kept) noexcept;
+std::size_t flip_gates() noexcept;
 // Where field `field` (an index into class_fields) lives: each copy's address and kind ('c' the
 // class's own layout, 's' the eight-byte slots, 'n' native code's copy). Returns how many.
 struct FieldCopy {
