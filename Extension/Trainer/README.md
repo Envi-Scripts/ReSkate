@@ -6,31 +6,68 @@ telemetry HUD. It ships no game data: the list of values is built at run time fr
 
 ## What it does
 
-**Slow flips that stay slow.** The game hurries a flip trick so the board is round 1/6 s before the landing it predicts. "Let slow flips stay slow" (TUNE > TRICKS, under Flip trick speed) switches that off: the board turns as slowly as you set it and lands however far round it got.
+The PHYSICS page opens on **Feel**, with five reference points: **Hardcore, Authentic, Stock,
+Accessible and Arcade**. Choose a reference or move the mixer to preview supported controls;
+**Apply this feel** commits the result. The preview respects both direct locks and locks inherited
+from linked controls. Unrelated edits stay as they are. Stock in the mixer restores only the
+curated controls; Settings > Reset and maintenance contains the broader resets.
 
-| Tab | What you get |
-|---|---|
-| **TUNE** | Four lists: REALISTIC, FUN, TRICKLINING and EVERYTHING, under a "Play like" choice (skate., Skate 3 Easy, Skate 3, Skate 3 Hardcore). TRICKLINING gathers what a line needs: the board bending boost (speed out of a landing with the board out of line, as in Skate 3) with its rules, revert and powerslide friction, pumping, pops, spins and flips, manuals and grinds, each with a line on what it is for. Each opens on the dials: every built-in preset as one slider (Ollie height, pop out of grinds, on-board gravity, landings, revert friction, pumping, Push speed, Body flip and spin speed, Bail resistance, Grind lock-on and friction, on-foot jump and sprint, glide, torpedo), where 1 is the game's own and the preset's button jumps to the preset; then the switches (Auto Push, No Speed Wobble, Smooth Surfaces, Long Wheelbase, Never bail), the trick sliders (flip trick speed, no comply, boneless, hippy and off-board jump height, and a revert speed boost: speed back on a landing the game auto reverts, from AutoRevertBoost by Sivaes, jaq and OVM) and the values themselves: a short plainly named list, or under EVERYTHING the whole table (the physics tuning's values, one multiplier per curve and graph, and the 314 values of the game's other tuning classes) with groups, "only what I changed", locks, your own saved presets and a preset a map applies every time it loads. One search box finds dials, trick sliders and values on every list; pointing at a named value says what it does. The built-in presets include Skate 3 (and its Hardcore and Easy): Skate 3's numbers for every value this game still shares with it. "Share" copies one of your presets as a line of text and "Import from clipboard" adds one you were sent. Changes apply while you skate. Values the game was never found or seen reading are hidden unless you ask for them. **Reset everything**, above the tabs, puts the game back as it shipped. |
-| **PRACTICE** | Game speed and pause, five marker slots per map (save / go / clear), return to the marker after a bail, teleport to coordinates, copy your position (game or Blender axes). |
-| **CAMERA** | Move the game's own cameras: distance, height, camera-only height and side for the low camera, the high camera and the on-foot camera, with buttons for SunJay's Low Cam numbers and a low camera that shows more of the skater. The cameras keep their smoothing and stay out of walls. Below it, an experimental camera of your own that replaces the game's (it does not avoid walls). |
-| **MAP & HUD** | Speed and air-time HUD, a read-out after every jump (takeoff speed and angle, height, distance, drop, landing speed, spin and flip), telemetry recording to CSV, and whatever the map's author ships for the trainer. |
+- **Feel:** full-width stock-relative sliders, grouped into pop and airtime, speed and rotations,
+  landings and bails, and grinds and slides. The control label stays above its editor. Drag to
+  adjust; Ctrl-click or double-click to type; Enter commits and Escape cancels. Edits commit
+  when editing finishes rather than sending a command every frame.
+- **Settings:** search the complete value table, select a group, show changed or locked controls,
+  and optionally reveal unverified values and individual graph points. Labels have tooltips for
+  their complete name and description. Arbitrary values use full-width numeric drag editors.
+- **Presets:** save physics or trick-only setups, review saved inputs before applying, import and
+  share presets, or select a preset to apply when a map loads. Replacing and deleting saved
+  presets require a confirmation. Imports add to the library without applying and use a new
+  name when one is already taken. The existing Skate 3 reference presets remain available here.
+- **Fun:** the existing Super shortcuts, boosts and experimental controls, with trick height,
+  flip and tricklining settings below. Never bail stays in Skater > Movement.
+- **Tools:** the existing Practice, Camera and Map & HUD pages. Practice has game speed, five
+  marker slots per map, bail returns and teleport. Camera has native rigs and the experimental
+  custom camera. Map & HUD has telemetry, CSV recording and map-author recommendations.
 
-The HUD, the jump read-out and the controller shortcuts are off until you switch them on (MAP & HUD,
-PRACTICE): a player who never opens the trainer sees and feels nothing of it.
+**Hardcore grinds:** rail lock-on, boardslide capture and nose/tail-slide capture use **0.1x this
+map's stock distance**, matching the earlier workshop slider minimum. Common and curb friction
+use 1.4x stock, and grind pop heights use 0.75x stock. Entry speed and angle requirements are
+independent and stay unchanged by these rules. These profiles are starting points for playtesting;
+they are not calibrated simulations of real skating.
 
-Controller: **LB + RB + click the right stick** opens and closes the menu (D-pad or left stick moves, A presses, B goes back);
-it can be switched off on PRACTICE. With the marker shortcuts switched on: hold **LB + RB**, then D-pad **up** saves the marker,
-**down** goes to it, **left / right** pick the slot.
+**Slow flips that stay slow:** Fun > Trick height and flip settings > Let slow flips stay slow
+holds off the game's finish-before-landing rule. The board turns at the chosen flip speed and
+can land partway round.
 
-Everything is also a console command (`~`): `trainer open [tune|practice|camera|map|realistic|fun|everything]`, `trainer status`, `trainer set <id> <value>`,
-`trainer find <words>`, `trainer preset apply|remove|export <name>`, `trainer preset import`, `trainer camera rig low|high|foot distance|height|raise|side <number>`, `trainer dial <multiplier> <preset name>`,
+The HUD, jump read-out and marker shortcuts are off until enabled in Tools. The controller menu
+shortcut is **LB + RB + click the right stick**; it can be disabled in Practice. D-pad or left
+stick navigates, A presses and B goes back. With marker shortcuts enabled, hold **LB + RB**:
+D-pad up saves, down returns, and left/right picks a slot.
+
+Console commands (`~`) include:
+
+`trainer open [feel|settings|presets|fun|practice|camera|map]`, `trainer status`,
+`trainer workshop <hardcore|authentic|stock|accessible|arcade|-1..1>`,
+`trainer assist <0.1..5>`, `trainer set <id> <value>`, `trainer find <words>`,
+`trainer preset apply|remove|save|delete|export <name>`, `trainer preset import [file]`,
+`trainer dial <multiplier> <preset name>`,
 `trainer reset <id>|all|tricks|presets|everything`, `trainer marker save|go|clear [slot]`,
+`trainer camera rig low|high|foot distance|height|raise|side <number>`,
 `trainer tp <x> <y> <z>`, `trainer where`, `trainer jumps`, `trainer dump`, `trainer selftest`.
+
+Legacy `trainer open` names still route to their equivalent section. The community trainer's
+`trainer feel stock|easy|normal|hardcore` keeps its Skate 3 behavior; `trainer workshop` is the
+separate stock-relative mixer.
+
+Shared imports are limited to 2 MiB and 8192 finite numeric values. Invalid or oversized presets
+are rejected as a whole, not truncated. Unknown keys are kept for other game builds. The profile
+writer uses an adjacent temporary file and an atomic replacement, keeping the previous profile
+if writing or replacing fails.
 
 ## For map makers: `trainer.json`
 
 Put a `trainer.json` in your mod folder (beside `manifest.json`). Stock ReSkate ignores it; with the
-trainer, players get your spots and your recommended tuning on the MAP & HUD tab.
+trainer, players get your spots and your recommended tuning in Tools > Map & HUD.
 
 ```json
 {
@@ -112,7 +149,7 @@ folder>` (CMake option `DINGOSDK_BUILD_TRAINER_TESTS`) lists the tuning values w
   out as the class lays them out (`trainer_classes.cpp`; the table in `trainer_classes.inc` is
   generated from the game's own data). The search reads all of the game's writable memory, so it
   only runs for a player with a use for it: one of those values or the flip speed is not the
-  game's own (theirs, or a host's they skate with), or the EVERYTHING list is open. Then it runs
+  game's own (theirs, or a host's they skate with), or the Settings list is open. Then it runs
   on its own thread a few seconds after a level loads, and at most three times per level;
   `trainer classes` says what it found. Native code keeps its own copy of the push speeds, found
   and written the same way.

@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased — Feel workshop
+
+- Reorganize PHYSICS around Feel, Settings, Presets, Fun and Tools. Keep existing camera,
+  practice, tricklining, map and Skate 3 tuning features in their corresponding sections.
+- Add five reference feels and a continuous stock-relative preview with an explicit Apply.
+  Preserve locks and unrelated edits. Add a dedicated grind capture dial and Hardcore's
+  coordinated 0.1x capture, 1.4x friction and 0.75x grind pop rules.
+- Give tuning controls full-width editors, visible labels and grouped advanced sections.
+  Commit numeric edits on completion, preserve command precision, and cancel typed edits
+  with Escape. Wrap navigation and reference buttons at narrow widths and larger UI scales.
+- Add saved-preset review and replacement/deletion confirmations. Enable saving script-only
+  setups. Retain previous user presets and preserve imported unknown values.
+- Reject invalid and oversized imports without the previous 512-value truncation. Bound
+  file reads and atomically replace profiles without deleting the last good save first.
+- Add native ImGui interaction/layout tests, profile and import tests, and Feel rule tests.
+  Correct the session-extras test's out-of-range stimulus; valid 50x flip speed remains valid.
+
+
 ## v0.4.1 - 2026-10-06
 
 Built on ReSkate 1.1.3. Everything of the 0.4.0 test build, plus:

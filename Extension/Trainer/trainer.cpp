@@ -3,6 +3,9 @@
 #include "trainer_jump.h"
 #include "trainer_presets.h"
 #include "trainer_session.h"
+#include "trainer_feel.h"
+#include "trainer_atomic_file.h"
+#include "trainer_preset_io.h"
 #include "Extension/Multiplayer/Hud/follow_camera.h"
 #include "Engine/Core/Json/json.h"
 #include "Engine/Core/Log/logging.h"
@@ -219,11 +222,9 @@ std::filesystem::path game_directory() {
 }
 std::optional<Json> read_json(const std::filesystem::path &path) {
     try {
-        std::ifstream file(path, std::ios::binary);
-        if (!file) return std::nullopt;
-        const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-        if (text.empty() || text.size() > 1024 * 1024) return std::nullopt;
-        return Json::parse(text);
+        const auto text = storage::read_bounded(path, 32 * 1024 * 1024);
+        if (!text || text->empty()) return std::nullopt;
+        return Json::parse(*text, {.bytes = 32 * 1024 * 1024, .events = 4 * 1024 * 1024});
     } catch (...) {
         return std::nullopt;
     }
@@ -454,17 +455,9 @@ void save_store() {
         if (directory.empty()) return;
         std::error_code error;
         std::filesystem::create_directories(directory, error);
-        const auto target = directory / L"trainer.json", temporary = directory / L"trainer.json.tmp";
-        {
-            std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
-            file << json.dump(2);
-            if (!file) return;
-        }
-        std::filesystem::rename(temporary, target, error);
-        if (error) {
-            std::filesystem::remove(target, error);
-            std::filesystem::rename(temporary, target, error);
-        }
+        if (error) { say(logging::Level::warning, "Trainer: could not create the profile folder."); return; }
+        if (const auto saved = storage::write_atomic(directory / L"trainer.json", json.dump(2)); saved)
+            say(logging::Level::warning, "Trainer: save failed; previous trainer.json was preserved: " + saved.message());
     } catch (...) {
         say(logging::Level::warning, "Trainer: could not save trainer.json.");
     }
@@ -1060,7 +1053,7 @@ std::string apply_preset(std::string_view name) {
     if (std::ranges::find(s.active, applied) == s.active.end()) s.active.push_back(applied);
     changed();
     return std::format("{}: {} values set{}.", applied, count,
-                       locked ? std::format("; {} locked values left alone (untick their boxes in Tune to let presets change them)", locked) : "");
+                       locked ? std::format("; {} locked values left alone (untick their boxes in Settings to let presets change them)", locked) : "");
 }
 
 // ---- maps ------------------------------------------------------------------------------
@@ -1492,6 +1485,7 @@ void build_view() {
         next->rows.push_back({e.id, e.label, e.group, e.kind, e.value, e.stock, e.touched, e.frozen, e.detail, std::string(friendly), rank, modes,
                               e.used});
         next->rows.back().help = essential_help(e.key);
+        next->rows.back().preset_locked = is_locked(e);
         if (e.touched) ++next->touched;
         if (std::ranges::find(next->groups, e.group) == next->groups.end()) next->groups.push_back(e.group);
     }
@@ -1528,7 +1522,11 @@ void build_view() {
             next->presets.push_back(std::move(row));
         }
     }
-    for (const auto &[name, values] : s.user) next->presets.push_back({name, std::format("{} values", values.size()), false, is_active(name)});
+    for (const auto &[name, values] : s.user) {
+        PresetRow row{name, std::format("{} values", values.size()), false, is_active(name)};
+        row.values.assign(values.begin(), values.end());
+        next->presets.push_back(std::move(row));
+    }
     next->slot = s.slot;
     next->auto_return = s.auto_return;
     next->hippy_height = s.hippy_height;
@@ -1560,6 +1558,7 @@ void build_view() {
     next->open_serial = s.open_serial;
     next->stock = s.revert == RevertTuning{} && !s.camera_on && s.rigs == std::array<RigSetting, camera_rigs>{} && !next->touched && s.active.empty() && std::ranges::none_of(s.entries, &Entry::frozen) &&
                   std::ranges::all_of(trick_names, [](std::string_view name) { return *trick_option(name) == trick_stock(name); }) && s.flip_gate;
+    next->capture_changed = next->touched || !s.flip_gate || std::ranges::any_of(trick_names, [](std::string_view name) { return *trick_option(name) != trick_stock(name); });
     next->share_text = s.share_text;
     next->share_serial = s.share_serial;
     next->open_tab = s.open_tab;
@@ -1653,12 +1652,9 @@ std::string import_preset(const std::string &file_name) {
     if (directory.empty()) return "error: the trainer's folder could not be found.";
     const auto path = directory / (file_name.empty() ? "clipboard.txt" : file_stem(std::filesystem::path(file_name).stem().string()) + ".json");
     std::string text;
-    {
-        std::ifstream file(path, std::ios::binary);
-        if (!file) return file_name.empty() ? "error: there is nothing to import." : "error: shared\\" + path.filename().string() + " does not exist.";
-        text.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
-    }
-    if (text.size() > 256 * 1024) return "error: that is too long to be a preset.";
+    const auto bounded = storage::read_bounded(path, storage::shared_bytes_limit);
+    if (!bounded) return "error: preset file is missing, unreadable or exceeds 2 MiB. Nothing was imported.";
+    text = *bounded;
     if (const auto tag = text.find(share_tag); tag != std::string::npos) {
         const auto start = tag + share_tag.size();
         const auto end = text.find_first_of(" \t\r\n`\"'", start);
@@ -1667,23 +1663,25 @@ std::string import_preset(const std::string &file_name) {
         text = *decoded;
     }
     try {
-        const auto json = Json::parse(text);
+        const auto json = Json::parse(text, {.bytes = storage::shared_bytes_limit});
         if (!json.is_object() || !json.contains("values") || !json.at("values").is_object()) return "error: that is not a ReSkate Trainer preset.";
+        const auto decoded_values = storage::decode_values(json.at("values"));
+        if (!decoded_values) return "error: preset values are invalid or exceed 8192 entries. Nothing was imported.";
         std::map<std::string, double, std::less<>> values;
         std::size_t unknown{};
-        for (const auto &[key, value] : json.at("values").items()) {
-            if (!value.is_number() || values.size() >= 512) continue;
+        for (const auto &[key, value] : *decoded_values) {
             const auto id = lower(key);
             const bool trick = id.starts_with(trick_prefix) && (trick_option(std::string_view(id).substr(trick_prefix.size())) ||
                                                                 std::string_view(id).substr(trick_prefix.size()) == flip_gate_name);
             if (!trick && !find_entry(id)) ++unknown; // kept: another build of the game may have it
-            values[id] = value.get<double>();
+            if (!values.emplace(id, value).second)
+                return "error: preset contains duplicate value ids with different letter casing. Nothing was imported.";
         }
         if (values.empty()) return "error: that preset holds no values.";
         auto name = json.value("name", "Imported");
         if (name.empty() || name.size() > 40) name = "Imported";
         const auto taken = [&](const std::string &candidate) {
-            if (lower(candidate) == "stock" || lower(candidate) == "map" || s.user.contains(candidate)) return true;
+            if (lower(candidate) == "stock" || lower(candidate) == "map" || std::ranges::any_of(s.user, [&](const auto &item) { return lower(item.first) == lower(candidate); })) return true;
             return std::ranges::any_of(builtin_presets(), [&](const auto &preset) { return lower(preset.name) == lower(candidate); });
         };
         auto unique = name;
@@ -1970,6 +1968,43 @@ std::string camera_command(const std::vector<std::string> &a) {
     }
     return "error: usage: trainer camera on|off | game | preset <name> | set board|foot <field> <number>";
 }
+// Curated workshop profiles coexist with the historical Skate 3 feel command.
+std::string workshop_command(const std::vector<std::string> &arguments, bool assistance = false) {
+    auto &s = state();
+    std::string why;
+    if (!s.ready) return "error: load a level before changing physics.";
+    if (!editable(&why)) return "error: " + why;
+    if (arguments.size() != 1) return "error: supply one feel name or mixer value.";
+    auto value = assistance ? number(arguments[0]) : workshop::amount(arguments[0]);
+    if (!value) value = number(arguments[0]);
+    if (!value || (assistance ? *value < .1 || *value > 5 : *value < -1 || *value > 1))
+        return assistance ? "error: capture assistance must be between 0.1 and 5x stock." : "error: feel must be Hardcore, Authentic, Stock, Accessible, Arcade or -1..1.";
+    std::vector<Row> rows;
+    rows.reserve(s.entries.size());
+    for (const auto &entry : s.entries) {
+        Row row; row.id = entry.id; row.value = entry.value; row.stock = entry.stock; row.kind = entry.kind;
+        row.used = entry.used; row.detail = entry.detail; row.preset_locked = is_locked(entry);
+        rows.push_back(std::move(row));
+    }
+    auto plan = workshop::preview(rows, *value);
+    if (assistance) {
+        plan.clear();
+        for (const auto &row : rows) {
+            const auto key = lower(row.id);
+            if (!row.used || row.detail || (key != "physicsmode.grindlockdist" && key != "physicsgrindsair.maxdistboardslide" && key != "physicsgrindsair.maxdisttipslide")) continue;
+            plan.push_back({row.id, row.value, static_cast<float>(row.stock * *value), row.preset_locked});
+        }
+    }
+    std::size_t applied{}, locked{};
+    for (const auto &change : plan) {
+        if (auto *entry = find_entry(change.id)) {
+            if (is_locked(*entry)) { ++locked; continue; }
+            set_entry(*entry, change.after); ++applied;
+        }
+    }
+    changed();
+    return std::format("{}: {} supported values applied, {} locks kept. Other edits stay.", assistance ? "Grind capture assistance" : "Workshop feel", applied, locked);
+}
 std::string run(std::string_view verb, const std::vector<std::string> &a) {
     auto &s = state();
     const auto v = lower(verb);
@@ -2091,6 +2126,9 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
         if (!s.flip_gate) values[std::string(trick_prefix) + std::string(flip_gate_name)] = 0;
             if (values.empty()) return "error: nothing is changed, so there is nothing to save.";
             const auto count = values.size();
+            // Commands resolve names without case; saving must replace that same entry.
+            const auto existing = std::ranges::find_if(s.user, [&](const auto &item) { return lower(item.first) == lower(name); });
+            if (existing != s.user.end()) name = existing->first;
             s.user[name] = std::move(values);
             changed();
             return std::format("Saved \"{}\" ({} values).", name, count);
@@ -2107,6 +2145,8 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
     if (v == "revert") return revert_command(a);
     if (v == "trickline") return trickline_command(a);
     if (v == "feel") return feel_command(a);
+    if (v == "workshop") return workshop_command(a);
+    if (v == "assist") return workshop_command(a, true);
     if (v == "slot") {
         const auto slot = slot_argument(a, 0);
         if (!slot) return std::format("error: slots are 1 to {}.", marker_slots);
@@ -2208,10 +2248,10 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
     if (v == "open") {
         const auto tab = lower(arg(0));
         // The last three are the Tune tab on one of its lists.
-        const std::array<std::string_view, 9> tabs{"tune", "presets", "practice", "map", "realistic", "fun", "everything", "camera", "trickline"};
+        const std::array<std::string_view, 11> tabs{"tune", "presets", "practice", "map", "realistic", "fun", "everything", "camera", "trickline", "feel", "settings"};
         const auto found = std::ranges::find(tabs, tab);
         if (!tab.empty() && found == tabs.end()) return "error: usage: trainer open [tune|trickline|practice|camera|map|realistic|fun|everything]";
-        s.open_tab = tab.empty() ? 1 : static_cast<int>(found - tabs.begin());
+        s.open_tab = tab.empty() ? 9 : static_cast<int>(found - tabs.begin());
         ++s.open_serial;
         s.view_due = true;
         return "Opening the trainer.";
@@ -2267,7 +2307,7 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
 bool stage_import(std::string_view text) noexcept {
     try {
         const auto directory = shared_directory();
-        if (directory.empty() || text.empty() || text.size() > 256 * 1024) return false;
+        if (directory.empty() || text.empty() || text.size() > storage::shared_bytes_limit) return false;
         std::error_code error;
         std::filesystem::create_directories(directory, error);
         std::ofstream file(directory / "clipboard.txt", std::ios::binary | std::ios::trunc);
