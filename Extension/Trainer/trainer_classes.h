@@ -43,6 +43,9 @@ void want_class_value(std::size_t field, float value) noexcept;
 bool classes_wanted() noexcept;
 // Writes the wanted values into every copy found; call each tick. Returns the fields written.
 std::size_t apply_classes() noexcept;
+// Call each tick (it acts once a second): writes again what the game has put back to its own
+// numbers. True when something wanted has nowhere left to go, so a new search is due.
+bool refresh_classes(std::uint64_t now) noexcept;
 std::string classes_summary();
 // Board flip trick speed. The game's flip trick tuning is a class of eight curves and no numbers
 // (speed against the flick, against the ollie...); the search finds it as eight curve references

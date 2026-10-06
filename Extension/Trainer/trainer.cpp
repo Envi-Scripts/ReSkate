@@ -139,6 +139,8 @@ struct State {
     int class_search_tries{};
     std::uint64_t class_search_seen{};      // the searches that had finished when this level loaded
     bool class_list_wanted{};               // the player has the list of every value open on this level
+    std::uint64_t class_entity{};           // the skater the last search was for
+    std::uint64_t class_research_after{};   // no new search before this, however many skaters come and go
     std::vector<std::size_t> class_entries; // the entries that are fields of those classes
     // A session whose host sets everyone's physics (session_physics.h): what the host shares
     // beyond its tuning, and what each class field holds for it. The player's own stand down.
@@ -1687,6 +1689,20 @@ void tick(std::uintptr_t base, std::uintptr_t client, bool playing, const std::s
         }
         want_flip_speed(s.boosts.flip);
         (void)apply_classes();
+        // The game builds its tuning objects again with a new skater (a respawn, a teleport, a
+        // session change) and they start at its own numbers: look again, but not in a flurry.
+        {
+            const bool lost = refresh_classes(now);
+            const auto entity = static_cast<std::uint64_t>(s.entity);
+            const bool new_skater = entity && s.class_entity && entity != s.class_entity;
+            if (entity) s.class_entity = entity;
+            if ((lost || new_skater) && classes_wanted() && !s.class_search_at && now >= s.class_research_after && !finding_classes()) {
+                s.class_search_seen = class_searches();
+                s.class_search_tries = 0;
+                s.class_search_at = now + 2000;
+                s.class_research_after = now + 20000;
+            }
+        }
         set_trick_heights(s.boosts.nocomply, s.boosts.boneless);
         // The speeds pushes aim for are the push class's (value_links ties them to the tuning's top
         // pushing speed, which only gates whether a push may start).
