@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.4.3 - 2026-10-07
+
+Built on ReSkate 1.1.4 (0.4.2 was built on 1.1.3). The trainer itself is unchanged.
+
 ## v0.4.2 - 2026-10-07
 
 - **Flip trick speed really sets the speed, both ways, and each trick can have its own.** The
