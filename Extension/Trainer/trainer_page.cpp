@@ -810,7 +810,7 @@ void trickline_section(SkateMenu &menu, const CallbacksV3 &callbacks, Page &p, c
          "mattered there. Forward force: a push the game adds while you revert or slide.");
     rows(0);
     end_card();
-    trick_heights(menu, callbacks, p, view, std::string{});
+    // Trick controls are owned by the separate Fun section above.
     for (std::size_t g = 1; g < std::size(groups); ++g) {
         if (p.trick_rows[g].empty()) continue;
         begin_card(menu, groups[g][0], groups[g][0]);

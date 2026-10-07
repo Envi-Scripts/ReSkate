@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <stdexcept>
 namespace physics=dingosdk::trainer;
 using namespace dingosdk::overlay;
@@ -57,10 +58,12 @@ void image(const std::filesystem::path &path, const ImDrawData &data, const unsi
     require(static_cast<bool>(output), "Could not write native UI preview");
 }
 
-struct NativeItem { ImRect rectangle; ImGuiWindow *window{}; std::string label; int frame{}; bool disabled{}; };
+struct NativeItem { ImRect rectangle; ImGuiWindow *window{}; std::string label; int frame{}; int submissions{}; bool disabled{}; };
 std::map<ImGuiID, NativeItem> native_items;
 void ImGuiTestEngineHook_ItemAdd(ImGuiContext *context, ImGuiID id, const ImRect &rectangle, const ImGuiLastItemData *data) {
-    auto &item = native_items[id]; item.rectangle = rectangle; item.window = context->CurrentWindow; item.frame = context->FrameCount;
+    auto &item = native_items[id];
+    if (item.frame != context->FrameCount) item.submissions = 0;
+    ++item.submissions; item.rectangle = rectangle; item.window = context->CurrentWindow; item.frame = context->FrameCount;
     item.disabled = data && (data->ItemFlags & ImGuiItemFlags_Disabled);
 }
 void ImGuiTestEngineHook_ItemInfo(ImGuiContext *, ImGuiID id, const char *label, ImGuiItemStatusFlags) { native_items[id].label = label ? label : ""; }
@@ -105,6 +108,7 @@ int main(int argc, char **argv) {
         add("physicsgrindsair.maxdisttipslide", "Nose and tail slide capture distance", .7f);
         add("physicsgrind.commonfrictionscalar", "Grind friction", .35f);
         add("physicsmode.jumpmaxheight", "Ollie height", 1.575f);
+        add("onboard_powerslide.frictionscalar_revert", "Revert friction", 3.0f);
         add("physicsmode.grindjumpcommonmax", "Maximum pop out of a grind", 2.3f);
         add("physicsmode.deepcrouch", "Landing: leg length (lower crouches deeper; deliberately long label)", .65f);
         view->groups.push_back("Physics");
@@ -119,17 +123,20 @@ int main(int argc, char **argv) {
         unsigned char *atlas{}; int atlas_width{}, atlas_height{};
         io.Fonts->GetTexDataAsRGBA32(&atlas,&atlas_width,&atlas_height);
         bool visible=true;
-        float width=1000, scale=1;
+        float width=1000, height=850, scale=1;
         const auto frame = [&] {
-            io.DisplaySize=ImVec2(width+40,1000*scale); io.DeltaTime=1.0f/60;
+            io.DisplaySize=ImVec2(width+40,(height+150)*scale); io.DeltaTime=1.0f/60;
             model.menu_scale=scale; physics::publish(view);
-            ImGui::NewFrame(); ImGui::SetNextWindowSize(ImVec2(width,850*scale),ImGuiCond_Always);
+            ImGui::NewFrame();
+            // Production first-use defaults replace pending SetNextWindowSize data.
+            // Resize the existing named fixture window directly on later frames.
+            ImGui::SetWindowSize("ReSkate###skate-menu",ImVec2(width,height*scale),ImGuiCond_Always);
             draw_skate_menu(skate,model,callbacks,visible); ImGui::Render();
         };
         const auto click = [&](const char *label) {
             const auto item=native_item(label); require(!item.disabled,"Click target must be enabled");
             const auto centre=item.rectangle.GetCenter();
-            require(item.window->ClipRect.Contains(centre),"Click target must be visible");
+            if (!item.window->ClipRect.Contains(centre)) throw std::runtime_error(std::string("Click target must be visible: ")+label);
             io.AddMousePosEvent(centre.x,centre.y); io.AddMouseButtonEvent(0,true); frame();
             io.AddMouseButtonEvent(0,false); frame(); frame();
         };
@@ -146,6 +153,37 @@ int main(int argc, char **argv) {
         queued.clear(); save("feel-wide.ppm");
         click("FUN"); native_item("Super Ollie");
         require(queued.empty(),"Navigating to Fun applies no shortcut"); save("fun-wide.ppm");
+        // Submit both expanded cards together. A tall headless viewport keeps the
+        // real widgets visible, so clipping cannot hide a duplicate submission.
+        height=3600; frame(); frame();
+        click("Tricklining and reverts"); click("Trick height and flip settings");
+        click("What counts as a bend, and what it is worth"); frame();
+        const auto widgets_once = [&](ImGuiWindow *window, const char *label, int expected) {
+            int count=0;
+            for (const auto &[id,item] : native_items)
+                if (item.frame==GImGui->FrameCount && item.window==window && item.label==label) {
+                    require(id!=0 && item.submissions==1,"Each real widget ID must be submitted exactly once per frame");
+                    ++count;
+                }
+            if (count!=expected) throw std::runtime_error(std::string("Expanded card widget count: ")+label+" expected "+std::to_string(expected)+", got "+std::to_string(count));
+        };
+        auto *tricks=native_item("Let slow flips stay slow").window;
+        require(tricks->BeginCount==1,"Both FUN sections must render the TRICKS card only once");
+        widgets_once(tricks,"##height",5); widgets_once(tricks,"##typed",6);
+        widgets_once(tricks,"##strength",1); widgets_once(tricks,"Let slow flips stay slow",1);
+        widgets_once(tricks,"Reset tricks",1);
+        auto *reverts=native_item("Reset these rules").window;
+        require(reverts!=tricks && reverts->BeginCount==1,"Revert rules retain their own single card");
+        widgets_once(reverts,"##value",11); widgets_once(reverts,"##typed",10);
+        widgets_once(reverts,"##freeze",1); widgets_once(reverts,"Reset these rules",1);
+        require(queued.empty(),"Expanding both FUN sections does not change any setting");
+        click("Reset these rules");
+        require(queued.size()==1 && queued.back()=="trainer revert reset","The surviving revert reset queues its exact command once");
+        queued.clear(); click("Reset tricks");
+        require(queued.size()==1 && queued.back()=="trainer reset tricks","The single TRICKS reset remains functional");
+        queued.clear();
+        click("Trick height and flip settings"); click("Tricklining and reverts");
+        height=850; frame(); frame();
         click("SETTINGS");
         auto scalar=native_item("##value");
         require(scalar.rectangle.GetWidth()>600,"Settings use the full content width below labels"); save("settings-wide.ppm");
