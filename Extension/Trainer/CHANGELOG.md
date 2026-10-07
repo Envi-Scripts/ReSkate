@@ -1,7 +1,40 @@
 # Changelog
 
-## v0.4.2 - 2026-10-06
+## v0.4.2 - 2026-10-07
 
+- **Flip trick speed really sets the speed, both ways, and each trick can have its own.** The
+  slider now multiplies the speed the trick's animation plays at while the board is in the air
+  (the game state Float.Anim.TrickFlipSpeed), not the curves in front of it: x 0.5 is half
+  speed, x 2 is double (faster than the game's own never worked before), for every flip trick,
+  shuvits, 360 flips and varials included, and the pop is untouched. **Advanced trick speed**
+  adds a speed for each of 16 tricks (kickflip, heelflip, the shuvits, varials, 360 flip, laser
+  flip, hardflip, inward heelflip, impossibles; a nollie uses its regular trick's), multiplied
+  with the main one. Presets carry them (`trick.flip.<trick>`, `trick.flip_advanced`).
+- **A slow flip is slow from the start.** Below x 1 the game's finish-before-landing rule is held
+  off by itself, so the board is not hurried round: with too little air you land on a board that
+  is still turning. The switch "Let slow flips stay slow" of 0.4.1 is gone: this does its job
+  (a preset that carries it still loads).
+- **Pump power.** A new slider under TRICKS sizes what pumping a transition gives: 1 is the
+  game's own, x 2 is about one more of the game's pumps on top of each of yours, x 10 and up is
+  a rocket, under 1 takes speed away. The game's own pumping state (Bool.Intent.Pumping) says
+  when you are pumping, and for every physics step it does the trainer adds speed along your
+  travel (`trainer option pump_power <x>`, preset key `trick.pump_power`). Like the flip speed
+  it is found about 15 seconds after a level loads. Off under a host's enforced physics or with
+  boosts off. It replaces the dial "Pumping strength" (Pump Power), which changed nothing: the
+  game's own gain is small (0.3 to 1 m/s a pump, measured) and fades the faster you already go.
+- **The camera tab is gone.** The camera controls did not work reliably, so they are out of this
+  version: the CAMERA tab, `trainer camera` and the saved camera numbers (ignored if present).
+- **The dial "On foot: flip and roll speed" is gone.** It changed nothing in the game. The three
+  values are still listed under EVERYTHING.
+- **Far fewer memory searches.** Every bail builds a new skater and each one started a full search
+  of the game's memory (about 13 seconds of a background thread), so a session of slow flips
+  searched over and over. A search that a new skater asked for and that found nothing new now
+  doubles the wait before the next (20 s up to 10 minutes); a level load or a real change puts it
+  back.
+- **It takes about 15 seconds after every level load.** The game loads its flip animation states
+  with the level, and the trainer has to find them in memory again; until it has, the main
+  slider falls back to the old, weaker way and the per-trick speeds do nothing. The TRICKS card
+  says so while it is looking.
 - **Board bending boost: no more speed from ordinary 180s.** 0.4.1 also counted a landing whose
   board and body were together 12 degrees or more out of line with the travel. The game
   straightens plain short or crooked 180s (flip trick 180s too) that way, so they got a boost,
@@ -10,15 +43,6 @@
   AutoRevertBoost. Settings saved by 0.4.1 with the old 12 are moved to off. Turn the rule on
   yourself and a landing that counts by it alone gets the auto revert boost at most. Found and
   measured by AutoRevertBoost's authors (Sivaes, jaq and OVM).
-- **Flip trick speed no longer lowers your ollie.** The slider used to scale seven of the game's
-  flip curves and shrink the range each one is read over; three of those are what a flick adds
-  to the height of the pop, so a slow flip came with a low ollie. It now scales only the one
-  curve that turns the stick's speed into the flip's speed. Measured on flat ground at x 0.3:
-  kickflips at about half the game's turn rate, plain ollies the same height and air time as
-  with the slider untouched.
-- **Let slow flips stay slow says when it is off.** In a session whose host enforces physics or
-  has turned trick settings off, the switch cannot act (the likely reason it seemed to work only on
-  the main map); a line under it now says so.
 
 ## v0.4.1 - 2026-10-06
 

@@ -34,6 +34,8 @@ void find_classes() noexcept;
 bool finding_classes() noexcept;
 // How many searches have finished (0: none yet).
 std::uint64_t class_searches() noexcept;
+// A number that changes when a search finds something it did not know (or loses something).
+std::uint64_t class_search_found() noexcept;
 // Copies of class `index` found.
 std::size_t class_copies(std::size_t index) noexcept;
 // What field `field` (an index into class_fields) should hold. Written by apply_classes.
@@ -60,7 +62,12 @@ std::size_t flip_curves() noexcept;
 // slow the flip speed is set. `kept` false holds that rule off: the board turns as slowly as set
 // and lands however far round it got. The search finds the rule's number; flip_gates says whether
 // it did (0: nothing to switch yet).
-void want_flip_gate(bool kept) noexcept;
+// `seconds`: how long before the landing it predicts the game has a flip round. The game's own is
+// flip_gate_stock; flip_gate_off never hurries a flip; anything else moves the catch.
+inline constexpr float flip_gate_stock = 1.0f / 6.0f, flip_gate_off = -1000.0f;
+void want_flip_gate(float seconds) noexcept;
+// Something else needs the game states the search finds (the pump power): a reason to search.
+void states_in_use(bool used) noexcept;
 std::size_t flip_gates() noexcept;
 // Where field `field` (an index into class_fields) lives: each copy's address and kind ('c' the
 // class's own layout, 's' the eight-byte slots, 'n' native code's copy). Returns how many.

@@ -4,7 +4,7 @@
 // The game thread owns the trainer's state (trainer.cpp). Every change is a `trainer ...`
 // console command, so the menu page (presentation thread) only queues commands and reads
 // the two snapshots below; nothing here touches the game from the UI.
-#include "trainer_camera.h"
+#include "trainer_gamestate.h"
 #include "Extension/Skater/client_source_spawn.h"
 #include <array>
 #include <cstdint>
@@ -57,11 +57,6 @@ struct Spot {
 inline constexpr std::size_t marker_slots = 5;
 
 // Changes rarely: rebuilt when a command or a level load changes something.
-// The Camera tab: one framing on the board and one on foot (Extension/Multiplayer/Hud/follow_camera.h).
-struct CameraSet {
-    float distance{3.4f}, height{1.5f}, pitch{-9.0f}, side{}, fov{}, lag{0.08f};
-    bool operator==(const CameraSet &) const = default;
-};
 struct View {
     std::uint64_t revision{};
     bool ready{};        // the game's tuning is read and the running game's copy was found
@@ -69,6 +64,8 @@ struct View {
     std::string last;    // what the last command answered
     bool editable{};     // false while a session's host sets everyone's physics (the host's apply)
     std::string blocked; // the reason shown on locked rows
+    bool session_enforced{}; // a guest where the host (or the server) sets everyone's physics
+    bool boosts_blocked{};   // a session whose host turned boosts off: the trick extras are the game's own
     std::vector<Row> rows;
     std::vector<std::string> groups;
     std::vector<PresetRow> presets;
@@ -87,23 +84,26 @@ struct View {
     // The same for the no comply and the boneless.
     float nocomply_height{1}, boneless_height{1};
     float revert_boost{}; // strength of the speed given back on an auto revert; 0: off
+    float pump_power{1};  // x what pumping a transition gains
+    bool pump_live{};     // the game's pumping states are found: the pump power acts
+    bool pump_blocked{};  // set, but this session's rules keep the game's own pumping
     RevertTuning revert;  // what counts as a revert and what it is worth
     float offboard_height{1}; // a jump on foot
     float flip_speed{1};      // board flip tricks: x of the game's own speed
-    bool flip_gate{true};     // the game brings a flip round before the landing; false: slow flips stay slow
+    bool flip_advanced{};     // each flip trick also has a speed of its own
+    std::array<float, flip_tricks.size()> flip_trick{}; // those, in the order of flip_tricks
+    bool flip_advanced_blocked{};       // ticked, but this session's rules keep the game's own flips
+    bool flip_live{};                   // the game's flip states are found: the speeds act
     bool flip_gate_found{};   // the rule's number was found in memory (the switch can act)
     bool flip_gate_blocked{}; // ticked, but this session's rules keep the game's own flips
+    bool catch_at{};          // flips are caught at a set part of the jump
+    float catch_percent{70};  // which part: percent of the air time
     // HUD
     bool hud{}, hud_jump{}, logging{};
     // The loaded map and what its author ships for the trainer (Mods/<mod>/trainer.json).
     std::string map, map_note, map_preset, profile_preset;
     std::vector<Spot> spots;
     // `trainer open <tab>`: each new serial opens the menu on the trainer page at that tab.
-    bool camera_on{};
-    CameraSet camera_board, camera_foot{1.9f, 1.6f, -8.0f, 0.4f, 0.0f, 0.06f};
-    std::string camera_game; // how the game itself frames the skater, measured
-    std::array<RigSetting, camera_rigs> rigs{}; // the game's own cameras, moved
-    std::string rigs_found;                     // what of their data was found
     std::uint64_t open_serial{};
     std::string share_text; // `preset export`: the line to put on the clipboard
     std::uint64_t share_serial{};

@@ -31,13 +31,15 @@ struct Page {
     std::array<char, 49> preset_name{};
     std::array<float, 3> teleport{};
     double speed_edit{-1}, speed_until{};
-    float hippy_edit{1}, nocomply_edit{1}, boneless_edit{1}, offboard_edit{1}, flip_edit{1};
+    float hippy_edit{1}, nocomply_edit{1}, boneless_edit{1}, offboard_edit{1}, flip_edit{1}, pump_edit{1};
+    std::array<float, trainer::flip_tricks.size()> trick_edit{}; // the speed of each flip trick
+    std::array<bool, trainer::flip_tricks.size()> trick_editing{};
     float revert_edit{};
     bool revert_editing{};
     // The Tricklining list: rows of the value table per group, for one snapshot.
     std::array<std::vector<std::size_t>, 5> trick_rows;
     std::uint64_t trick_revision{~0ull};
-    bool hippy_editing{}, nocomply_editing{}, boneless_editing{}, offboard_editing{}, flip_editing{};
+    bool hippy_editing{}, nocomply_editing{}, boneless_editing{}, offboard_editing{}, flip_editing{}, pump_editing{};
     std::uint64_t open_serial{}; // the last `trainer open` acted on
     std::uint64_t share_serial{}; // the last `preset export` put on the clipboard
     bool share_seen{};
@@ -196,7 +198,7 @@ void dial_row(SkateMenu &menu, const CallbacksV3 &callbacks, Page &p, const trai
     if (ImGui::IsItemHovered())
         wrapped_tooltip("%s\n1 is the game's own; \"%s\" is x %s.", preset.note.c_str(), preset.name.c_str(), number(preset.amount).c_str());
     ImGui::SameLine(column);
-    const float button = ImGui::CalcTextSize("Fast Parkour Flips").x + ImGui::GetStyle().FramePadding.x * 2;
+    const float button = ImGui::CalcTextSize("Easy Body Flips  ").x + ImGui::GetStyle().FramePadding.x * 2;
     const float reset = ImGui::CalcTextSize("Reset").x + ImGui::GetStyle().FramePadding.x * 2;
     const auto id = "dial:" + preset.name;
     double value = p.active == id ? p.active_value : preset.factor;
@@ -245,7 +247,6 @@ void tune_tab(SkateMenu &menu, const Model &model, const CallbacksV3 &callbacks,
         end_card();
         return;
     }
-    if (!view.editable) warn(view.blocked.c_str());
     // Two short lists, the trick line section and the whole table (modes 0, 1, 3 and 2).
     {
         static constexpr std::pair<const char *, int> modes[]{{"REALISTIC", 0}, {"FUN", 1}, {"TRICKLINING", 3}, {"EVERYTHING", 2}};
@@ -441,14 +442,15 @@ void tune_tab(SkateMenu &menu, const Model &model, const CallbacksV3 &callbacks,
 }
 
 void trick_heights(SkateMenu &menu, const CallbacksV3 &callbacks, Page &p, const trainer::View &view, const std::string &words) {
-    static constexpr const char *labels[]{"Flip trick speed", "Let slow flips stay slow (no finish before landing)", "No comply height", "Boneless height", "Hippy jump height", "Off-board jump height",
+    static constexpr const char *advanced_label = "Advanced trick speed (a speed for each flip trick: kickflip, heelflip, 360 flip, varial, shuvit, hardflip, laser flip, impossible)";
+    static constexpr const char *labels[]{"Flip trick speed", advanced_label, "Pump power (pumping transitions)", "Catch flips at a set point of the jump (realism, percent of air time)", "No comply height", "Boneless height", "Hippy jump height", "Off-board jump height",
                                            "Board bending boost (revert speed)"};
     const auto wanted = [&](const char *label) { return words.empty() || contains_words(lower(std::string(label) + " tricks"), words); };
     if (std::ranges::none_of(labels, wanted)) return;
     begin_card(menu, "trick-heights", "TRICKS", "1.0 is the game's own");
     // `limited`: the game itself stops at the slider's end, so a typed number is held to it too.
-    const auto slider = [&](const char *label, const char *option, float value, float &edit, bool &editing, const char *help, float high = 50.0f, bool limited = false) {
-        if (!wanted(label)) return false;
+    const auto slider = [&](const char *label, const char *option, float value, float &edit, bool &editing, const char *help, float high = 50.0f, bool limited = false, bool always = false) {
+        if (!always && !wanted(label)) return false;
         field(menu, label);
         ImGui::PushID(option);
         float shown = editing ? edit : value;
@@ -474,24 +476,60 @@ void trick_heights(SkateMenu &menu, const CallbacksV3 &callbacks, Page &p, const
         return true;
     };
     slider("Flip trick speed", "flip_speed", view.flip_speed, p.flip_edit, p.flip_editing,
-           "How fast the board turns in a flip trick. It does not change how high you pop. Below 1 a flip is slower. On its own the game still "
-           "hurries a slow flip so it is finished before you land: tick the switch below to stop that. Above 1 the game's own limit on how fast a "
-           "board turns takes over.",
+           "How fast the board turns in every flip trick. It does not change how high you pop. Below 1 flips are slower, above 1 faster. A slow "
+           "flip is slow from the start and is not hurried round before you land: with too little air you land on a board that is still turning. "
+           "It takes about 15 seconds to take hold after every level load: the trainer has to find the game's flip animations again first.",
            3.0f);
-    if (wanted("Let slow flips stay slow (no finish before landing)")) {
-        bool slow = !view.flip_gate;
-        if (ImGui::Checkbox("Let slow flips stay slow", &slow)) trainer_command(menu, callbacks, std::format("option flip_gate {}", slow ? 0 : 1));
+    if (!view.flip_live && (view.flip_speed != 1.0f || view.flip_advanced) && wanted("Flip trick speed"))
+        ImGui::TextDisabled("Finding the flip animations: flip speeds take hold about 15 seconds after a level loads.");
+    if (wanted(advanced_label)) {
+        bool on = view.flip_advanced;
+        if (ImGui::Checkbox("Advanced trick speed", &on)) trainer_command(menu, callbacks, std::format("option flip_advanced {}", on ? 1 : 0));
+        tip("Gives every flip trick a speed of its own, on top of the flip trick speed above: a kickflip at 1.0 and a 360 flip at 0.6, say. "
+            "A trick turns at the speed above times its own. Nollie tricks use their regular trick's speed. Pop height is not changed. "
+            "Unticked, the speeds below are kept but not used. Like the speed above, they take hold about 15 seconds after every level load.");
+        if (view.flip_advanced_blocked) ImGui::TextDisabled("Off in this multiplayer game: the host's rules apply here.");
+        if (on && ImGui::TreeNodeEx("Speed of each flip trick", ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_DefaultOpen)) {
+            for (std::size_t i = 0; i < trainer::flip_tricks.size(); ++i) {
+                const auto &trick = trainer::flip_tricks[i];
+                const std::string label(trick.label), option(trick.key);
+                slider(label.c_str(), option.c_str(), view.flip_trick[i], p.trick_edit[i], p.trick_editing[i],
+                       "How fast the board turns in this trick, times the flip trick speed above. 1 leaves it at that speed.", 3.0f, false, true);
+            }
+            ImGui::TreePop();
+        }
+    }
+    if (wanted("Catch flips at a set point of the jump (realism, percent of air time)")) {
+        bool on = view.catch_at;
+        if (ImGui::Checkbox("Catch flips at a set point of the jump", &on)) trainer_command(menu, callbacks, std::format("option catch_at {}", on ? 1 : 0));
         if (ImGui::IsItemHovered())
-            wrapped_tooltip("%s", "The game speeds a flip up so the board is round 1/6 of a second before the landing it predicts, however slow the flip speed "
-                                  "is set. That is why a slowed flip still comes round on a small pop. Ticked: that rule is off. The board turns as "
-                                  "slowly as you set it and lands however far round it got, so a flip you start too late or too low is a bail.");
-        if (view.flip_gate_blocked) ImGui::TextDisabled("Off in this session: the host's physics rules apply here, so flips finish before landing as usual.");
-        else if (slow && !view.flip_gate_found) ImGui::TextDisabled("Not found in the game yet: it takes effect a few seconds after a level loads.");
+            wrapped_tooltip("%s", "For realism. Every flip trick turns so that the board is round, and caught, at the percent of the jump's air time "
+                                  "you set: 70 means the catch comes 70% of the way from the pop to the landing, on a small ollie and a big one alike. "
+                                  "While this is on the trainer sets the flip speed and the finish-before-landing rule itself, so the flip speed "
+                                  "above stands aside. The air time is worked out from the pop over level ground: off a drop or a gap the catch "
+                                  "comes earlier than asked. 100 or close to it means you land still flipping.");
+        ImGui::SameLine();
+        float percent = view.catch_percent;
+        ImGui::SetNextItemWidth(px(64));
+        if (ImGui::InputFloat("##catch-percent", &percent, 0, 0, "%.6g", ImGuiInputTextFlags_EnterReturnsTrue))
+            trainer_command(menu, callbacks, std::format("option catch_percent {}", percent));
+        if (ImGui::IsItemHovered()) wrapped_tooltip("%s", "Percent of the air time at which the flip is caught. Type a number from 1 to 100 and press Enter.");
+        ImGui::SameLine();
+        ImGui::TextUnformatted("% of the air time");
+        if (view.catch_at && view.flip_gate_blocked) ImGui::TextDisabled("Off in this multiplayer game: the host's rules apply here.");
+        else if (on && !view.flip_gate_found) ImGui::TextDisabled("Not found in the game yet: it takes effect a few seconds after a level loads.");
     }
     slider("No comply height", "nocomply_height", view.nocomply_height, p.nocomply_edit, p.nocomply_editing, "How high a no comply pops. 1 is the game's own.");
     slider("Boneless height", "boneless_height", view.boneless_height, p.boneless_edit, p.boneless_editing, "How high a boneless pops. 1 is the game's own.");
     slider("Hippy jump height", "hippy_height", view.hippy_height, p.hippy_edit, p.hippy_editing, "How high you jump off the board in a hippy jump. 1 is the game's own.");
     slider("Off-board jump height", "offboard_height", view.offboard_height, p.offboard_edit, p.offboard_editing, "How high you jump on foot. 1 is the game's own.");
+    if (slider("Pump power (pumping transitions)", "pump_power", view.pump_power, p.pump_edit, p.pump_editing,
+               "How much speed pumping a transition gives. 1 is the game's own; 2 gives about one more of the game's pumps on top of each "
+               "of yours, 10 about nine more, and under 1 takes speed away. The game still decides when you are pumping: the extra comes "
+               "for as long as it counts you as pumping. It is found in the game about 15 seconds after a level loads.")) {
+        if (view.pump_blocked) ImGui::TextDisabled("Off in this multiplayer game: the host's rules apply here.");
+        else if (view.pump_power != 1.0f && !view.pump_live) ImGui::TextDisabled("Finding the game's pumping in memory: it acts about 15 seconds after a level loads.");
+    }
     if (wanted("Board bending boost (revert speed)")) {
         // Not a multiplier: 0 is the game's own (no boost).
         field(menu, "Board bending boost");
@@ -522,7 +560,8 @@ void trick_heights(SkateMenu &menu, const CallbacksV3 &callbacks, Page &p, const
     }
     if (ImGui::Button("Reset tricks")) {
         p.revert_editing = false;
-        p.hippy_editing = p.nocomply_editing = p.boneless_editing = p.offboard_editing = p.flip_editing = false;
+        p.hippy_editing = p.nocomply_editing = p.boneless_editing = p.offboard_editing = p.flip_editing = p.pump_editing = false;
+        p.trick_editing = {};
         trainer_command(menu, callbacks, "reset tricks");
     }
     tip("Puts every slider and switch on this card back to the game's own.");
@@ -809,114 +848,6 @@ void trickline_section(SkateMenu &menu, const CallbacksV3 &callbacks, Page &p, c
     ImGui::EndDisabled();
 }
 
-// The player's own follow camera, in place of the game's: one framing on the board, one on foot.
-void camera_tab(SkateMenu &menu, const CallbacksV3 &callbacks, Page &p, const trainer::View &view) {
-    begin_card(menu, "rigs", "THE GAME'S CAMERAS", "Move the game's own cameras: they keep their smoothing and stay out of walls");
-    if (ImGui::Button("SunJay's Low Cam")) trainer_command(menu, callbacks, "camera rig sunjay");
-    if (ImGui::IsItemHovered()) wrapped_tooltip("Both on-board cameras low and close, the numbers of SunJay's Low Cam mod.");
-    ImGui::SameLine();
-    if (ImGui::Button("Low, a little higher")) trainer_command(menu, callbacks, "camera rig low+");
-    if (ImGui::IsItemHovered()) wrapped_tooltip("The low camera lower and closer, but with more of the skater in view.");
-    ImGui::SameLine();
-    if (ImGui::Button("The game's own")) trainer_command(menu, callbacks, "camera rig stock");
-    tip("Puts all three of the game's cameras back as they shipped.");
-    static constexpr const char *rig_ids[]{"low", "high", "foot"};
-    static constexpr const char *rig_titles[]{"Low camera (on board)", "High camera (on board)", "On foot"};
-    for (std::size_t i = 0; i < trainer::camera_rigs; ++i) {
-        ImGui::SeparatorText(rig_titles[i]);
-        const auto &rig = view.rigs[i];
-        const auto slider = [&](const char *label, const char *field, float value, float low, float high, const char *format, const char *tip) {
-            ImGui::PushID(static_cast<int>(i));
-            ImGui::PushID(field);
-            menu::field(menu, label);
-            const auto key = std::string("rig:") + rig_ids[i] + field;
-            float shown = p.active == key ? static_cast<float>(p.active_value) : value;
-            ImGui::SetNextItemWidth(std::max(px(70), ImGui::GetContentRegionAvail().x - px(64) - ImGui::GetStyle().ItemSpacing.x));
-            if (ImGui::SliderFloat("##value", &shown, low, high, format)) trainer_command(menu, callbacks, std::format("camera rig {} {} {:.3f}", rig_ids[i], field, shown));
-            if (ImGui::IsItemHovered() && !ImGui::IsItemActive()) wrapped_tooltip("%s", tip);
-            ImGui::SameLine();
-            float typed = value;
-            ImGui::SetNextItemWidth(px(64));
-            if (ImGui::InputFloat("##typed", &typed, 0, 0, "%.6g", ImGuiInputTextFlags_EnterReturnsTrue))
-                trainer_command(menu, callbacks, std::format("camera {} {} {} {}", "rig", rig_ids[i], field, typed));
-            if (ImGui::IsItemHovered()) wrapped_tooltip("Type any number and press Enter: the slider's ends are not a limit.");
-
-            if (ImGui::IsItemActive()) {
-                p.active = key;
-                p.active_value = shown;
-            } else if (p.active == key) {
-                p.active.clear();
-            }
-            ImGui::PopID();
-            ImGui::PopID();
-        };
-        slider("Distance", "distance", rig.distance, 0.3f, 3.0f, "x %.2f", "How far behind you the camera sits. 1 is the game's own.");
-        slider("Height", "height", rig.height, -1.0f, 2.0f, "%+.2f m", "Moves the camera and the point it looks at up or down together.");
-        slider("Camera only", "raise", rig.raise, -1.0f, 2.0f, "%+.2f m", "Moves the camera alone, so it looks more down at you (or up from below).");
-        if (i == 2) slider("Shoulder", "side", rig.side, 0.0f, 2.0f, "%.2f", "Over the shoulder: 1 is the game's own (centred), above 1 moves right, below 1 moves left, by that many metres.");
-        else slider("Side", "side", rig.side, -2.0f, 2.0f, "x %.2f", "The camera's sideways offset. 1 is the game's own, 0 is dead centre, negative is the other shoulder.");
-    }
-    note(("Found: " + view.rigs_found + ". A change shows at once, or the next time that camera starts.").c_str());
-    end_card();
-    begin_card(menu, "camera", "A CAMERA OF YOUR OWN (EXPERIMENTAL)", "Replaces the game's camera altogether");
-    bool on = view.camera_on;
-    if (toggle_row(menu, "Use my camera", "Replaces the game's camera with the one set below. It stays behind the way you travel and does not avoid walls.", on))
-        trainer_command(menu, callbacks, std::format("camera {}", on ? "on" : "off"));
-    static constexpr const char *presets[]{"Low", "Low plus", "Skate 3", "High", "Shoulder", "Shoulder left"};
-    static constexpr const char *notes[]{
-        "Close to the ground behind the board, looking slightly up: the Skate 1 feel.", "The low camera raised a little, so more of the skater shows.",
-        "Close chase camera with a wide lens.", "Further back and above, for lines and big gaps.",
-        "On foot: over the right shoulder.", "On foot: over the left shoulder."};
-    for (std::size_t i = 0; i < std::size(presets); ++i) {
-        if (i) ImGui::SameLine();
-        if (ImGui::Button(presets[i])) trainer_command(menu, callbacks, std::string("camera preset ") + presets[i]);
-        if (ImGui::IsItemHovered()) wrapped_tooltip("%s", notes[i]);
-    }
-    if (view.camera_game.empty()) note("Skate a few seconds with the game's own camera and its framing is measured here.");
-    else {
-        info(menu, "The game frames you from", view.camera_game);
-        if (ImGui::Button("Start from the game's framing")) trainer_command(menu, callbacks, "camera game");
-        tip("Copies the framing measured from the game's camera into your camera's sliders below.");
-    }
-    end_card();
-    const auto set_card = [&](const char *id, const char *title, const char *which, const trainer::CameraSet &set) {
-        begin_card(menu, id, title);
-        const auto slider = [&](const char *label, const char *field, float value, float low, float high, const char *format, const char *tip) {
-            ImGui::PushID(field);
-            ImGui::PushID(which);
-            menu::field(menu, label);
-            const auto key = std::string("camera:") + which + field;
-            float shown = p.active == key ? static_cast<float>(p.active_value) : value;
-            ImGui::SetNextItemWidth(std::max(px(70), ImGui::GetContentRegionAvail().x - px(64) - ImGui::GetStyle().ItemSpacing.x));
-            if (ImGui::SliderFloat("##value", &shown, low, high, format)) trainer_command(menu, callbacks, std::format("camera set {} {} {:.3f}", which, field, shown));
-            if (ImGui::IsItemHovered() && !ImGui::IsItemActive()) wrapped_tooltip("%s", tip);
-            ImGui::SameLine();
-            float typed = value;
-            ImGui::SetNextItemWidth(px(64));
-            if (ImGui::InputFloat("##typed", &typed, 0, 0, "%.6g", ImGuiInputTextFlags_EnterReturnsTrue))
-                trainer_command(menu, callbacks, std::format("camera {} {} {} {}", "set", which, field, typed));
-            if (ImGui::IsItemHovered()) wrapped_tooltip("Type any number and press Enter: the slider's ends are not a limit.");
-
-            if (ImGui::IsItemActive()) {
-                p.active = key;
-                p.active_value = shown;
-            } else if (p.active == key) {
-                p.active.clear();
-            }
-            ImGui::PopID();
-            ImGui::PopID();
-        };
-        slider("Distance", "distance", set.distance, 0.5f, 10.0f, "%.2f m", "How far behind the skater the camera sits.");
-        slider("Height", "height", set.height, -0.5f, 5.0f, "%.2f m", "How far above the skater's feet. Low numbers give the classic low camera.");
-        slider("Tilt", "pitch", set.pitch, -60.0f, 30.0f, "%.0f deg", "Negative looks down at the skater, positive looks up.");
-        slider("Shoulder", "side", set.side, -1.5f, 1.5f, "%.2f m", "Sideways offset: positive is over the right shoulder.");
-        slider("Field of view", "fov", set.fov, 0.0f, 120.0f, set.fov < 20.0f ? "the game's" : "%.0f deg", "How wide the lens is. All the way left keeps the game's own.");
-        slider("Follow lag", "lag", set.lag, 0.0f, 0.5f, "%.2f s", "How far the camera trails behind your movement. 0 is rigid.");
-        end_card();
-    };
-    set_card("camera-board", "ON THE BOARD", "board", view.camera_board);
-    set_card("camera-foot", "ON FOOT", "foot", view.camera_foot);
-}
 
 void map_tab(SkateMenu &menu, const CallbacksV3 &callbacks, const trainer::View &view) {
     const auto telemetry = trainer::telemetry();
@@ -982,7 +913,7 @@ bool trainer_take_open() {
     if (view->open_serial == p.open_serial) return false;
     p.open_serial = view->open_serial;
     // `trainer open` still takes "presets": they live on the Tune tab now.
-    p.tab = view->open_tab == 7 ? 2 : view->open_tab == 3 ? 3 : view->open_tab == 2 ? 1 : 0; // by name, see `trainer open`
+    p.tab = view->open_tab == 3 ? 2 : view->open_tab == 2 ? 1 : 0; // by name, see `trainer open`
     if (view->open_tab == 8) p.mode = 3; // the trick line section of the Tune tab
     if (view->open_tab >= 4 && view->open_tab < 7) p.mode = std::clamp(view->open_tab - 4, 0, 2);
     p.show_page = true;
@@ -997,16 +928,21 @@ bool trainer_page_wanted() {
 void trainer_page(SkateMenu &menu, const Model &model, const CallbacksV3 &callbacks) {
     auto &p = page();
     const auto view = trainer::view();
-    ImGui::BeginDisabled(!callbacks.queue_console_command);
+    // A guest under the host's physics would only wipe a setup they cannot see at work here.
+    ImGui::BeginDisabled(!callbacks.queue_console_command || view->session_enforced);
     if (ImGui::Button("RESET EVERYTHING")) {
-        p.hippy_editing = p.nocomply_editing = p.boneless_editing = p.offboard_editing = p.flip_editing = p.revert_editing = false;
+        p.hippy_editing = p.nocomply_editing = p.boneless_editing = p.offboard_editing = p.flip_editing = p.pump_editing = p.revert_editing = false;
+        p.trick_editing = {};
         trainer_command(menu, callbacks, "reset everything");
     }
-    tip("Puts back every value, lock, preset, dial, trick setting and camera: the game exactly as it shipped.");
+    tip("Puts back every value, lock, preset, dial, trick setting: the game exactly as it shipped.");
     ImGui::EndDisabled();
+    if (view->session_enforced && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        wrapped_tooltip("%s", "Off in this multiplayer game: the host controls physics here. Your own setup is kept for when you leave.");
     ImGui::SameLine();
     ImGui::AlignTextToFramePadding();
-    if (view->ready && view->stock) ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1.0f), "STOCK: the game is exactly as it shipped. Nothing of the trainer's is on.");
+    if (view->session_enforced) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "HOST'S PHYSICS: your own setup is kept for when you leave.");
+    else if (view->ready && view->stock) ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1.0f), "STOCK: the game is exactly as it shipped. Nothing of the trainer's is on.");
     else if (view->ready) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "MODIFIED: this button puts back every value, lock, preset and trick slider.");
     else ImGui::TextDisabled("The game as it shipped: every value, lock, preset and trick slider.");
     // `preset export` leaves its line here; the clipboard belongs to this thread.
@@ -1017,13 +953,24 @@ void trainer_page(SkateMenu &menu, const Model &model, const CallbacksV3 &callba
         p.share_serial = view->share_serial;
         ImGui::SetClipboardText(view->share_text.c_str());
     }
-    category_tabs(menu, p.tab, {"TUNE", "PRACTICE", "CAMERA", "MAP & HUD"}, "trainer-tabs");
+    // Above the tabs, so every tab says why its controls do nothing in this session.
+    if (view->session_enforced) {
+        begin_card(menu, "session-note", "MULTIPLAYER: THE HOST CONTROLS PHYSICS");
+        warn("You are in a multiplayer game where the host controls physics. This menu will not work in this multiplayer game.");
+        note("You skate with the host's setup. HUD and markers still work. Your own setup comes back when you leave.");
+        end_card();
+    } else if (view->boosts_blocked) {
+        begin_card(menu, "session-note", "MULTIPLAYER: BOOSTS ARE OFF");
+        warn("The host has turned boosts off in this multiplayer game: trick sliders, flip speed, auto push and the board bending boost will not work here.");
+        note("The physics values still apply. The rest comes back when the host allows boosts or you leave.");
+        end_card();
+    }
+    category_tabs(menu, p.tab, {"TUNE", "PRACTICE", "MAP & HUD"}, "trainer-tabs");
     ImGui::PushID(p.tab);
     ImGui::BeginChild("trainer-tab", ImVec2(0, page_body_height(menu)));
     switch (p.tab) {
     case 0: tune_tab(menu, model, callbacks, p, *view); break;
     case 1: practice_tab(menu, model, callbacks, p, *view); break;
-    case 2: camera_tab(menu, callbacks, p, *view); break;
     default: map_tab(menu, callbacks, *view); break;
     }
     ImGui::EndChild();

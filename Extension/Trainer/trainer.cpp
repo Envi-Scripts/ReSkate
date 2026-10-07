@@ -1,9 +1,9 @@
 #include "trainer.h"
 #include "trainer_classes.h"
+#include "trainer_gamestate.h"
 #include "trainer_jump.h"
 #include "trainer_presets.h"
 #include "trainer_session.h"
-#include "Extension/Multiplayer/Hud/follow_camera.h"
 #include "Engine/Core/Json/json.h"
 #include "Engine/Core/Log/logging.h"
 #include "Engine/Game/Build/addresses.h"
@@ -16,6 +16,7 @@
 #include "Extension/Skater/client_source_spawn_internal.h"
 #include "Extension/Skater/no_bail.h"
 #include "Extension/Skater/physics_tuning.h"
+#include "Extension/Skater/skater_observer.h"
 #include "Extension/UI/Overlay/overlay.h"
 #include <windows.h>
 #include <shlobj.h>
@@ -29,7 +30,6 @@
 #include <map>
 #include <numbers>
 #include <optional>
-
 
 // Game thread only. See trainer.h for how the menu reaches this.
 namespace dingosdk::trainer {
@@ -94,6 +94,8 @@ struct Motion {
 struct Boosts {
     float flip{1}, hippy{1}, nocomply{1}, boneless{1}, offboard{1}, cruise{};
 };
+// How long a new skater alone waits for a memory search: doubled while searches find nothing new.
+constexpr std::uint64_t class_skater_wait_low = 20000, class_skater_wait_high = 600000;
 struct State {
     bool loaded{}; // the store was read
     std::shared_ptr<const tuning::Model> model;
@@ -116,9 +118,6 @@ struct State {
     int slot{};
     bool auto_return{}, pad_shortcuts{}, hud{}, hud_jump{}, logging{};
     bool pad_menu{true}; // LB + RB + R3 opens and closes the menu
-    std::array<RigSetting, camera_rigs> rigs{};
-    bool camera_on{};
-    CameraSet camera_board, camera_foot{1.9f, 1.6f, -8.0f, 0.4f, 0.0f, 0.06f};
     // The hippy jump's height is set by the game's trick scripts, not by tuning: the trainer
     // scales the upward velocity when it sees one start.
     float hippy_height{1};
@@ -126,12 +125,31 @@ struct State {
     float offboard_height{1};
     // Board flip tricks: a multiplier on the game's flip speed curves (trainer_classes.h).
     float flip_speed{1};
-    bool flip_gate{true}; // false: the game's finish-before-landing rule for flip tricks is held off
+    // "Advanced trick speed": each flip trick also turns at a speed of its own (flip_tricks, trainer_gamestate.h).
+    bool flip_advanced{};
+    std::array<float, flip_tricks.size()> flip_trick = [] {
+        std::array<float, flip_tricks.size()> ones{};
+        ones.fill(1.0f);
+        return ones;
+    }();
+    // The flip speed in the air now: the game's own number, what the trainer made of it, and whether it can be reached at all.
+    struct FlipDrive {
+        bool active{};
+        float game{}, written{};
+        float factor{1}; // the flip speed times the turning trick's own
+    } flip_drive;
+    bool flip_live{};
+    std::uint32_t flip_trick_seen{}; // the last trick that turned (CurrentFlipTrick)
+    bool catch_at{};           // flips are caught at catch_percent of the jump's air time
+    float catch_percent{70};
+    float catch_seconds{flip_gate_stock}; // what that comes to for the jump in the air now, as seconds before landing
     bool offboard_grounded{}; // off the board and not moving up or down at the last tick
     const char *boost_name{""};
     // The no comply and the boneless are launched by the trick scripts too (trainer_jump.cpp).
     float nocomply_height{1}, boneless_height{1};
     float revert_boost{};            // 0: off
+    float pump_power{1};             // x what pumping a transition gains
+    bool pump_live{};                // the game's pumping states are found
     RevertTuning revert;
     std::uint64_t revert_boosts_seen{};
     std::uint32_t last_state{};
@@ -146,6 +164,13 @@ struct State {
     float flip_applied{1};                  // the flip speed the catch times were last set for
     std::uint64_t class_entity{};           // the skater the last search was for
     std::uint64_t class_research_after{};   // no new search before this, however many skaters come and go
+    std::uint64_t class_creations{};        // the skaters the game had built at the last look
+    bool class_research_due{};              // a new skater came while a search could not start: look when it can
+    bool class_skater_due{};                // the same, for a new skater alone (nothing looked lost)
+    bool class_skater_judged{true};         // the search a new skater asked for has been compared with what was known
+    std::uint64_t class_skater_after{};     // no search for a new skater alone before this
+    std::uint64_t class_skater_wait{class_skater_wait_low};
+    std::uint64_t class_found{};            // class_search_found() before that search
     std::vector<std::size_t> class_entries; // the entries that are fields of those classes
     // A session whose host sets everyone's physics (session_physics.h): what the host shares
     // beyond its tuning, and what each class field holds for it. The player's own stand down.
@@ -238,50 +263,6 @@ std::optional<Vec3> read_position(const Json &value) {
     }
     return result;
 }
-// ---- the player's own camera -------------------------------------------------------------------
-struct CameraPreset {
-    std::string_view name, note;
-    bool foot; // it is a framing for walking, not skating
-    CameraSet set;
-};
-constexpr CameraPreset camera_presets[]{
-    {"Low", "Close to the ground behind the board, looking slightly up: the Skate 1 feel.", false, {2.6f, 0.45f, 4.0f, 0.0f, 78.0f, 0.06f}},
-    {"Low plus", "The low camera raised a little, so more of the skater shows.", false, {2.8f, 0.8f, 0.0f, 0.0f, 72.0f, 0.06f}},
-    {"Skate 3", "Close chase camera with a wide lens.", false, {2.3f, 0.9f, -2.0f, 0.0f, 80.0f, 0.1f}},
-    {"High", "Further back and above, for lines and big gaps.", false, {4.8f, 2.6f, -18.0f, 0.0f, 62.0f, 0.1f}},
-    {"Shoulder", "On foot: over the right shoulder.", true, {1.7f, 1.55f, -6.0f, 0.45f, 62.0f, 0.05f}},
-    {"Shoulder left", "On foot: over the left shoulder.", true, {1.7f, 1.55f, -6.0f, -0.45f, 62.0f, 0.05f}},
-};
-float *camera_field(CameraSet &set, std::string_view name) {
-    return name == "distance" ? &set.distance : name == "height" ? &set.height : name == "pitch" ? &set.pitch
-         : name == "side" ? &set.side : name == "fov" ? &set.fov : name == "lag" ? &set.lag : nullptr;
-}
-CameraSet sane_camera(CameraSet set) {
-    const auto finite = [](float value, float low, float high, float otherwise) { return std::isfinite(value) ? std::clamp(value, low, high) : otherwise; };
-    set.distance = finite(set.distance, 0.0f, 10000.0f, 3.4f);
-    set.height = finite(set.height, -10000.0f, 10000.0f, 1.5f);
-    set.pitch = finite(set.pitch, -89.0f, 89.0f, -9.0f);
-    set.side = finite(set.side, -10000.0f, 10000.0f, 0.0f);
-    set.fov = set.fov < 1.0f ? 0.0f : finite(set.fov, 1.0f, 179.0f, 0.0f);
-    set.lag = finite(set.lag, 0.0f, 60.0f, 0.08f);
-    return set;
-}
-Json write_camera(const CameraSet &set) {
-    Json row = Json::object();
-    row["distance"] = set.distance;
-    row["height"] = set.height;
-    row["pitch"] = set.pitch;
-    row["side"] = set.side;
-    row["fov"] = set.fov;
-    row["lag"] = set.lag;
-    return row;
-}
-CameraSet read_camera(const Json &row, CameraSet set) {
-    if (!row.is_object()) return set;
-    for (const auto name : {"distance", "height", "pitch", "side", "fov", "lag"})
-        if (row.contains(name) && row.at(name).is_number()) *camera_field(set, name) = row.at(name).get<float>();
-    return sane_camera(set);
-}
 Json write_position(const Vec3 &p) { return Json::array({Json(p[0]), Json(p[1]), Json(p[2])}); }
 
 struct RevertField {
@@ -304,7 +285,6 @@ RevertTuning sane_revert(RevertTuning tuning) {
     }
     return tuning;
 }
-RigSetting sane_rig(RigSetting rig);
 void load_store() {
     auto &s = state();
     s.loaded = true;
@@ -323,9 +303,14 @@ void load_store() {
             s.nocomply_height = std::clamp(o.value("nocomply_height", 1.0f), height_low, height_high);
             s.offboard_height = std::clamp(o.value("offboard_height", 1.0f), height_low, height_high);
             s.flip_speed = std::clamp(o.value("flip_speed", 1.0f), flip_low, flip_high);
-            s.flip_gate = o.value("flip_gate", true);
+            s.flip_advanced = o.value("flip_advanced", false);
+            for (std::size_t i = 0; i < flip_tricks.size(); ++i)
+                s.flip_trick[i] = std::clamp(o.value(std::string(flip_tricks[i].key), 1.0f), flip_low, flip_high);
+            s.catch_at = o.value("catch_at", false);
+            s.catch_percent = std::clamp(o.value("catch_percent", 70.0f), catch_low, catch_high);
             s.boneless_height = std::clamp(o.value("boneless_height", 1.0f), height_low, height_high);
             s.revert_boost = std::clamp(o.value("revert_boost", 0.0f), 0.0f, revert_boost_high);
+            s.pump_power = std::clamp(o.value("pump_power", 1.0f), 0.0f, pump_high);
             s.slot = std::clamp(o.value("slot", 0), 0, static_cast<int>(marker_slots) - 1);
         }
         if (json->contains("values") && json->at("values").is_object())
@@ -341,7 +326,8 @@ void load_store() {
             }
         if (json->contains("active") && json->at("active").is_array())
             for (const auto &name : json->at("active"))
-                if (name.is_string()) s.active.push_back(name.string());
+                // (Fast Parkour Flips and Pump Power were presets of earlier versions that changed nothing.)
+                if (name.is_string() && name.string() != "Fast Parkour Flips" && name.string() != "Pump Power") s.active.push_back(name.string());
         if (json->contains("revert") && json->at("revert").is_object()) {
             for (const auto &field : revert_fields)
                 if (const auto name = std::string(field.name); json->at("revert").contains(name) && json->at("revert").at(name).is_number())
@@ -350,25 +336,6 @@ void load_store() {
             // 180s: a file from before the rules were numbered that still holds it gets today's (off).
             if (!json->at("revert").contains("rules") && s.revert.min_slip == 12.0f) s.revert.min_slip = RevertTuning{}.min_slip;
             s.revert = sane_revert(s.revert);
-        }
-        if (json->contains("camera") && json->at("camera").is_object()) {
-            const auto &camera = json->at("camera");
-            s.camera_on = camera.value("on", false);
-            if (camera.contains("board")) s.camera_board = read_camera(camera.at("board"), s.camera_board);
-            if (camera.contains("foot")) s.camera_foot = read_camera(camera.at("foot"), s.camera_foot);
-            if (camera.contains("rigs") && camera.at("rigs").is_object())
-                for (std::size_t i = 0; i < camera_rigs; ++i) {
-                    const auto *name = i == 0 ? "low" : i == 1 ? "high" : "foot";
-                    if (!camera.at("rigs").contains(name) || !camera.at("rigs").at(name).is_object()) continue;
-                    const auto &row = camera.at("rigs").at(name);
-                    RigSetting rig;
-                    rig.distance = row.value("distance", 1.0f);
-                    rig.height = row.value("height", 0.0f);
-                    rig.raise = row.value("raise", 0.0f);
-                    rig.side = row.value("side", 1.0f);
-                    const auto finite = [](float value, float low, float high, float otherwise) { return std::isfinite(value) ? std::clamp(value, low, high) : otherwise; };
-                    s.rigs[i] = sane_rig(rig);
-                }
         }
         if (json->contains("maps") && json->at("maps").is_object())
             for (const auto &[level, row] : json->at("maps").items()) {
@@ -400,9 +367,14 @@ void save_store() {
         options["nocomply_height"] = s.nocomply_height;
         options["offboard_height"] = s.offboard_height;
         options["flip_speed"] = s.flip_speed;
-        options["flip_gate"] = s.flip_gate;
+        options["flip_advanced"] = s.flip_advanced;
+        for (std::size_t i = 0; i < flip_tricks.size(); ++i)
+            if (s.flip_trick[i] != 1.0f) options[std::string(flip_tricks[i].key)] = s.flip_trick[i];
+        options["catch_at"] = s.catch_at;
+        options["catch_percent"] = s.catch_percent;
         options["boneless_height"] = s.boneless_height;
         options["revert_boost"] = s.revert_boost;
+        options["pump_power"] = s.pump_power;
         options["slot"] = s.slot;
         json["options"] = std::move(options);
         Json values = Json::object();
@@ -439,21 +411,6 @@ void save_store() {
         for (const auto &field : revert_fields) revert[std::string(field.name)] = s.revert.*field.member;
         revert["rules"] = 2;
         json["revert"] = std::move(revert);
-        Json camera = Json::object();
-        camera["on"] = s.camera_on;
-        camera["board"] = write_camera(s.camera_board);
-        camera["foot"] = write_camera(s.camera_foot);
-        Json rigs = Json::object();
-        for (std::size_t i = 0; i < camera_rigs; ++i) {
-            Json row = Json::object();
-            row["distance"] = s.rigs[i].distance;
-            row["height"] = s.rigs[i].height;
-            row["raise"] = s.rigs[i].raise;
-            row["side"] = s.rigs[i].side;
-            rigs[i == 0 ? "low" : i == 1 ? "high" : "foot"] = std::move(row);
-        }
-        camera["rigs"] = std::move(rigs);
-        json["camera"] = std::move(camera);
         const auto directory = data_directory();
         if (directory.empty()) return;
         std::error_code error;
@@ -736,13 +693,12 @@ void adopt(const tuning::Values &live) {
     changed(false);
 }
 std::string apply_preset(std::string_view name);
-void drive_camera(bool playing);
 bool editable(std::string *why = nullptr) {
     // A guest's physics are the host's while the session enforces them: the tuning
     // (physics_tuning::enforce), and what the host shares beyond it (sync_session). Writing
     // over either would only fight the session, so the player's own stand down.
     if (session_tuning_enforced()) {
-        if (why) *why = "This session's host sets everyone's physics: you skate with the host's.";
+        if (why) *why = "You are in a multiplayer game where the host controls physics. This menu will not work in this multiplayer game.";
         return false;
     }
     return true;
@@ -755,12 +711,17 @@ float own_cruise() {
 // The host's where a session's host sets everyone's physics, whatever the boosts switch says
 // (that switch is about a guest's own); otherwise the player's, and the game's own in a
 // session that has turned boosts off.
+// A session where the player's own trick extras do not count: its host sets the physics, or has turned boosts off.
+bool extras_blocked() { return state().enforced || (multiplayer_session_active() && !session_boosts_allowed()); }
+// With the catch set by the air time, the flip itself has to be slow enough for that limit to be
+// what ends it (the game's own flip is over in a third of a second).
+constexpr float catch_flip_speed = 0.25f;
 Boosts boosts_in_force() {
     auto &s = state();
     if (s.enforced)
         return {s.host.flip_speed, s.host.hippy_height, s.host.nocomply_height, s.host.boneless_height, s.host.offboard_height, s.host.cruise};
     if (multiplayer_session_active() && !session_boosts_allowed()) return {};
-    return {s.flip_speed, s.hippy_height, s.nocomply_height, s.boneless_height, s.offboard_height, own_cruise()};
+    return {s.catch_at ? std::min(s.flip_speed, catch_flip_speed) : s.flip_speed, s.hippy_height, s.nocomply_height, s.boneless_height, s.offboard_height, own_cruise()};
 }
 // The player's own, for a session they host to share with its guests.
 void publish_extras() {
@@ -932,25 +893,41 @@ std::string apply_dial(std::string_view name, double factor) {
 }
 // A preset of the player's own also carries the trick sliders that are off 1, under these keys.
 constexpr std::string_view trick_prefix = "trick.";
-constexpr std::string_view trick_names[]{"flip_speed", "hippy_height", "nocomply_height", "boneless_height", "offboard_height", "revert_boost"};
-// What a trick slider is when the game is left alone: the multipliers 1, the revert boost off.
-constexpr std::string_view flip_gate_name = "flip_gate";
-constexpr float trick_stock(std::string_view name) { return name == "revert_boost" ? 0.0f : 1.0f; }
+constexpr std::string_view trick_sliders[]{"flip_speed", "hippy_height", "nocomply_height", "boneless_height", "offboard_height", "revert_boost", "pump_power"};
+// Those and the speed of each flip trick.
+constexpr auto trick_names = [] {
+    std::array<std::string_view, std::size(trick_sliders) + flip_tricks.size()> names{};
+    std::size_t at{};
+    for (const auto name : trick_sliders) names[at++] = name;
+    for (const auto &trick : flip_tricks) names[at++] = trick.key;
+    return names;
+}();
+constexpr std::string_view flip_gate_name = "flip_gate", catch_at_name = "catch_at", catch_percent_name = "catch_percent", flip_advanced_name = "flip_advanced";
+bool trick_switch(std::string_view name) { return name == flip_gate_name || name == catch_at_name || name == catch_percent_name || name == flip_advanced_name; }
+// What a trick slider or switch is when the game is left alone: the multipliers 1, the revert boost and the switches off.
+constexpr float trick_stock(std::string_view name) {
+    return name == "revert_boost" || name == catch_at_name || name == flip_advanced_name ? 0.0f : name == catch_percent_name ? 70.0f : 1.0f;
+}
 float *trick_option(std::string_view name) {
     auto &s = state();
+    for (std::size_t i = 0; i < flip_tricks.size(); ++i)
+        if (name == flip_tricks[i].key) return &s.flip_trick[i];
     return name == "flip_speed" ? &s.flip_speed : name == "hippy_height" ? &s.hippy_height : name == "nocomply_height" ? &s.nocomply_height
          : name == "boneless_height" ? &s.boneless_height : name == "offboard_height" ? &s.offboard_height
-         : name == "revert_boost" ? &s.revert_boost : nullptr;
+         : name == "revert_boost" ? &s.revert_boost : name == "pump_power" ? &s.pump_power : nullptr;
 }
 // Sets a trick slider named by a preset key; false when the key is not one.
 bool set_trick_key(std::string_view key, double value) {
     if (!key.starts_with(trick_prefix)) return false;
     const auto name = key.substr(trick_prefix.size());
-    // The slow-flip switch rides along as a number: 0 holds the game's finish-before-landing rule off.
-    if (name == flip_gate_name) state().flip_gate = value != 0;
+    // (flip_gate, a switch of earlier versions, still comes in old presets: a slow flip stays slow by itself now.)
+    if (name == catch_at_name) state().catch_at = value != 0;
+    if (name == flip_advanced_name) state().flip_advanced = value != 0;
+    if (name == catch_percent_name) state().catch_percent = std::clamp(static_cast<float>(value), catch_low, catch_high);
     if (auto *option = trick_option(name))
-        *option = name == "flip_speed" ? std::clamp(static_cast<float>(value), flip_low, flip_high)
+        *option = name == "flip_speed" || name.starts_with("flip.") ? std::clamp(static_cast<float>(value), flip_low, flip_high)
                 : name == "revert_boost" ? std::clamp(static_cast<float>(value), 0.0f, revert_boost_high)
+                : name == "pump_power" ? std::clamp(static_cast<float>(value), 0.0f, pump_high)
                 : std::clamp(static_cast<float>(value), height_low, height_high);
     return true;
 }
@@ -1105,7 +1082,6 @@ MapFile read_map_file(const std::string &level) {
 }
 void enter_map(const std::string &level) {
     auto &s = state();
-    forget_camera_rigs();
     s.map = level;
     s.map_file = level.empty() ? MapFile{} : read_map_file(level);
     s.motion = {};
@@ -1118,6 +1094,10 @@ void enter_map(const std::string &level) {
     s.class_search_at = level.empty() ? 0 : GetTickCount64() + 10000;
     s.class_search_tries = 0;
     s.class_search_seen = class_searches();
+    s.class_skater_wait = class_skater_wait_low;
+    s.class_skater_after = 0;
+    s.class_skater_due = false;
+    s.class_skater_judged = true;
     s.class_list_wanted = false;
     if (!level.empty()) {
         const auto found = s.maps.find(level);
@@ -1194,6 +1174,31 @@ void finish_jump(const Vec3 &landing, float landing_speed, std::int64_t landed_a
                     jump.serial, jump.takeoff_speed * 3.6f, jump.takeoff_angle, jump.air_time, jump.height, jump.distance, jump.drop,
                     jump.landing_speed * 3.6f, landing[0], landing[1], landing[2], jump.spin, jump.spin_rate, jump.flip, jump.board_turn, m.ground_state,
                     m.air_state));
+}
+// Board flip tricks turn at the game's speed times the player's. The trick scripts set
+// Float.Anim.TrickFlipSpeed when the board is flicked; while the skater is in the air the
+// trainer keeps it at that number times the flip speed (and, with "Advanced trick speed", times
+// the speed of the trick that is turning). On the ground the game's own number is put back.
+void drive_flip_speed(std::uintptr_t base, bool airborne) {
+    auto &s = state();
+    auto &drive = s.flip_drive;
+    const auto now = read_flip_state(base, static_cast<std::uintptr_t>(s.entity));
+    s.flip_live = static_cast<bool>(now);
+    if (!now || !airborne) {
+        if (now && drive.active && now.speed == drive.written && drive.written != drive.game) (void)write_flip_speed(now, drive.game);
+        drive = {};
+        return;
+    }
+    if (now.trick) s.flip_trick_seen = now.trick;
+    float factor = s.boosts.flip;
+    if (s.flip_advanced && !extras_blocked())
+        if (const auto index = flip_trick_index(now.trick); index >= 0) factor *= s.flip_trick[static_cast<std::size_t>(index)];
+    // A number that is not the trainer's own is the game's: the flight's first, or a new trick's.
+    if (!drive.active || now.speed != drive.written) drive.game = now.speed;
+    drive.active = true;
+    drive.factor = factor;
+    drive.written = std::clamp(drive.game * factor, 0.0f, 1000.0f);
+    if (now.speed != drive.written) (void)write_flip_speed(now, drive.written);
 }
 void observe(std::uintptr_t base, std::uintptr_t client, std::uint64_t now) {
     auto &s = state();
@@ -1306,9 +1311,29 @@ void observe(std::uintptr_t base, std::uintptr_t client, std::uint64_t now) {
         m.takeoff_stamp = m.stamp;
         m.apex = std::max(m.position[1], position[1]);
     }
+    // On the ground the limit is the game's own: the number left by the last flight means nothing for the next.
+    if (!m.airborne) state().catch_seconds = flip_gate_stock;
+    drive_flip_speed(base, m.airborne);
     if (m.airborne) {
         m.apex = std::max(m.apex, position[1]);
         t.air_time = static_cast<float>(clock_seconds(stamp - m.takeoff_stamp));
+        if (auto &own = state(); own.catch_at && flying) {
+            // The whole flight, guessed from where the skater is and how fast they rise: the time
+            // so far plus the time back down to the height they left from. Right over flat ground,
+            // short over a drop. The game has a flip round `seconds` before the landing it
+            // predicts, so the catch falls at the asked part of the flight.
+            const auto *gravity = find_entry("onboard_speedmodel.gravityacceleration");
+            const float g = std::max(1.0f, gravity ? static_cast<float>(gravity->touched ? gravity->value : gravity->stock) : 9.81f);
+            const float rise = velocity[1], above = std::max(0.0f, position[1] - m.takeoff[1]);
+            const float whole = t.air_time + (rise + std::sqrt(rise * rise + 2 * g * above)) / g;
+            // A catch asked for earlier than a board can come round (a flick late in a short
+            // jump) would make the limit negative, which the game reads as no limit at all and
+            // the flip crawls (measured at 10%: big pops turned at 450 deg/s to the ground). Such a
+            // flip is asked to come round as fast as the game turns one, about a fifth of a second.
+            constexpr float fastest_flip = 0.2f;
+            if (whole > 0.05f && whole < 60.0f)
+                own.catch_seconds = std::min((1 - own.catch_percent / 100) * whole, whole - t.air_time - fastest_flip);
+        }
         t.height = m.apex - m.takeoff[1];
         if (!flying)
             finish_jump(position, std::sqrt(m.velocity[0] * m.velocity[0] + m.velocity[1] * m.velocity[1] + m.velocity[2] * m.velocity[2]),
@@ -1488,6 +1513,8 @@ void build_view() {
     next->status = s.status;
     next->last = s.last;
     next->editable = editable(&next->blocked);
+    next->session_enforced = s.enforced;
+    next->boosts_blocked = !s.enforced && multiplayer_session_active() && !session_boosts_allowed();
     next->rows.reserve(s.entries.size());
     for (const auto &e : s.entries) {
         int rank{};
@@ -1539,11 +1566,19 @@ void build_view() {
     next->nocomply_height = s.nocomply_height;
     next->offboard_height = s.offboard_height;
     next->flip_speed = s.flip_speed;
-    next->flip_gate = s.flip_gate;
+    next->flip_advanced = s.flip_advanced;
+    next->flip_trick = s.flip_trick;
+    next->flip_advanced_blocked = s.flip_advanced && extras_blocked();
+    next->flip_live = s.flip_live;
     next->flip_gate_found = flip_gates() != 0;
-    next->flip_gate_blocked = !s.flip_gate && (s.enforced || (multiplayer_session_active() && !session_boosts_allowed()));
+    next->flip_gate_blocked = s.catch_at && extras_blocked();
+    next->catch_at = s.catch_at;
+    next->catch_percent = s.catch_percent;
     next->boneless_height = s.boneless_height;
     next->revert_boost = s.revert_boost;
+    next->pump_power = s.pump_power;
+    next->pump_live = s.pump_live;
+    next->pump_blocked = s.pump_power != 1.0f && extras_blocked();
     next->revert = s.revert;
     next->return_delay = s.return_delay;
     next->pad_shortcuts = s.pad_shortcuts;
@@ -1555,16 +1590,9 @@ void build_view() {
     next->map_note = s.map_file.note;
     next->map_preset = s.map_file.preset.empty() ? std::string{} : s.map_file.preset_name.empty() ? "Map preset" : s.map_file.preset_name;
     next->spots = s.map_file.spots;
-    next->rigs = s.rigs;
-    next->rigs_found = camera_rigs_summary();
-    next->camera_on = s.camera_on;
-    next->camera_board = s.camera_board;
-    next->camera_foot = s.camera_foot;
-    if (const auto profile = multiplayer::gameplay_camera_profile(); profile.samples >= 60)
-        next->camera_game = std::format("{:.1f} m behind, {:.1f} m up, tilt {:.0f} degrees, FOV {:.0f}", profile.distance, profile.height, profile.pitch, profile.fov);
     next->open_serial = s.open_serial;
-    next->stock = s.revert == RevertTuning{} && !s.camera_on && s.rigs == std::array<RigSetting, camera_rigs>{} && !next->touched && s.active.empty() && std::ranges::none_of(s.entries, &Entry::frozen) &&
-                  std::ranges::all_of(trick_names, [](std::string_view name) { return *trick_option(name) == trick_stock(name); }) && s.flip_gate;
+    next->stock = s.revert == RevertTuning{} && !next->touched && s.active.empty() && std::ranges::none_of(s.entries, &Entry::frozen) &&
+                  std::ranges::all_of(trick_names, [](std::string_view name) { return *trick_option(name) == trick_stock(name); }) && !s.catch_at && !s.flip_advanced;
     next->share_text = s.share_text;
     next->share_serial = s.share_serial;
     next->open_tab = s.open_tab;
@@ -1621,7 +1649,11 @@ std::string export_preset(const std::string &name) {
             if (e.touched) values[e.key] = e.value;
         for (const auto trick : trick_names)
             if (const auto *option = trick_option(trick); *option != trick_stock(trick)) values[std::string(trick_prefix) + std::string(trick)] = *option;
-        if (!s.flip_gate) values[std::string(trick_prefix) + std::string(flip_gate_name)] = 0;
+        if (s.flip_advanced) values[std::string(trick_prefix) + std::string(flip_advanced_name)] = 1;
+        if (s.catch_at) {
+            values[std::string(trick_prefix) + std::string(catch_at_name)] = 1;
+            values[std::string(trick_prefix) + std::string(catch_percent_name)] = s.catch_percent;
+        }
         title = "My setup";
     } else {
         for (const auto &[user_name, saved] : s.user)
@@ -1680,7 +1712,7 @@ std::string import_preset(const std::string &file_name) {
             if (!value.is_number() || values.size() >= 512) continue;
             const auto id = lower(key);
             const bool trick = id.starts_with(trick_prefix) && (trick_option(std::string_view(id).substr(trick_prefix.size())) ||
-                                                                std::string_view(id).substr(trick_prefix.size()) == flip_gate_name);
+                                                                trick_switch(std::string_view(id).substr(trick_prefix.size())));
             if (!trick && !find_entry(id)) ++unknown; // kept: another build of the game may have it
             values[id] = value.get<double>();
         }
@@ -1725,7 +1757,6 @@ void tick(std::uintptr_t base, std::uintptr_t client, bool playing, const std::s
         s.base = base;
         sync_session();
         s.boosts = boosts_in_force();
-        drive_camera(playing);
         if (const auto key = lower(playing ? level : std::string{}); key != s.map) enter_map(key);
         if (playing) {
             observe(base, client, now);
@@ -1759,11 +1790,16 @@ void tick(std::uintptr_t base, std::uintptr_t client, bool playing, const std::s
                 find_classes();
             }
         }
-        flip_speed_in_use(s.boosts.flip != 1.0f);
-        want_flip_speed(s.boosts.flip);
+        flip_speed_in_use(s.boosts.flip != 1.0f || s.flip_advanced);
+        // The speed itself goes straight to the trick in the air (drive_flip_speed); the flip curves
+        // are only scaled where that number cannot be reached.
+        want_flip_speed(s.flip_live ? 1.0f : s.boosts.flip);
         // The player's own choice, and only where their own trick settings count: not under a
         // host's enforced physics or in a session that has turned boosts off.
-        want_flip_gate(s.flip_gate || s.enforced || (multiplayer_session_active() && !session_boosts_allowed()));
+        // A flip asked to be slow is slow from the start: the game's rule would hurry it round before
+        // the landing, so it is held off for as long as the speed in force is under the game's own.
+        const bool slow = (s.flip_drive.active ? s.flip_drive.factor : s.boosts.flip) < 1.0f;
+        want_flip_gate(extras_blocked() ? flip_gate_stock : s.catch_at ? s.catch_seconds : slow ? flip_gate_off : flip_gate_stock);
         if (s.boosts.flip != s.flip_applied) {
             // The catch times follow the flip speed (want_class).
             s.flip_applied = s.boosts.flip;
@@ -1776,20 +1812,61 @@ void tick(std::uintptr_t base, std::uintptr_t client, bool playing, const std::s
         {
             const bool lost = refresh_classes(now);
             const auto entity = static_cast<std::uint64_t>(s.entity);
-            const bool new_skater = entity && s.class_entity && entity != s.class_entity;
+            bool new_skater = entity && s.class_entity && entity != s.class_entity;
             if (entity) s.class_entity = entity;
-            if ((lost || new_skater) && classes_wanted() && !s.class_search_at && now >= s.class_research_after && !finding_classes()) {
+            // A respawn can keep the entity and still fill new copies (the push speeds' native
+            // one among them): the old ones go on holding what was written, so nothing looks lost.
+            if (const auto creations = skater_creations(); creations != s.class_creations) {
+                new_skater = new_skater || s.class_creations != 0;
+                s.class_creations = creations;
+            }
+            // A bail builds a new skater too, and most of those bring nothing new: a search that a
+            // new skater asked for and that found only what was known doubles the wait before the
+            // next one (a search reads all of the game's writable memory, for seconds).
+            if (!s.class_skater_judged && !s.class_search_at && !finding_classes()) {
+                s.class_skater_judged = true;
+                s.class_skater_wait = class_search_found() == s.class_found ? std::min(s.class_skater_wait * 2, class_skater_wait_high) : class_skater_wait_low;
+                s.class_skater_after = now + s.class_skater_wait;
+            }
+            s.class_research_due = s.class_research_due || lost;
+            s.class_skater_due = s.class_skater_due || new_skater;
+            if (!classes_wanted()) s.class_research_due = s.class_skater_due = false;
+            const bool for_lost = s.class_research_due && now >= s.class_research_after;
+            const bool for_skater = s.class_skater_due && now >= s.class_skater_after && now >= s.class_research_after;
+            if ((for_lost || for_skater) && !s.class_search_at && !finding_classes()) {
+                s.class_research_due = s.class_skater_due = false;
                 s.class_search_seen = class_searches();
                 s.class_search_tries = 0;
-                s.class_search_at = now + 2000;
+                s.class_search_at = now + 3000;
                 s.class_research_after = now + 20000;
+                if (!for_lost) {
+                    s.class_skater_judged = false;
+                    s.class_found = class_search_found();
+                    s.class_skater_after = now + s.class_skater_wait;
+                }
             }
         }
         set_trick_heights(s.boosts.nocomply, s.boosts.boneless);
         // The speeds pushes aim for are the push class's (value_links ties them to the tuning's top
         // pushing speed, which only gates whether a push may start).
         const auto *top_speed = find_entry("physicspush.maxpushablespeed");
-        set_push_speed(client, s.entity, 1.0f, top_speed ? static_cast<float>(top_speed->stock) : 0.0f, s.boosts.cruise);
+        // Past the game's own ceiling the push is carried by the trainer (see trainer_push_speed):
+        // the player's own setting only, like the other speed the trainer adds.
+        const float push_factor = top_speed && top_speed->touched && top_speed->stock > 0 && !extras_blocked()
+                                      ? std::max(1.0f, static_cast<float>(top_speed->value / top_speed->stock)) : 1.0f;
+        set_push_speed(client, s.entity, push_factor, top_speed ? static_cast<float>(top_speed->stock) : 0.0f, s.boosts.cruise);
+        // Pumping: the game says when (its pumping state), the trainer sizes the gain on the physics
+        // step (trainer_pump_power). The player's own setting only, like the push speed.
+        {
+            const auto pump = read_pump_state(base, static_cast<std::uintptr_t>(s.entity));
+            if (pump.found != s.pump_live) {
+                s.pump_live = pump.found;
+                s.view_due = true;
+            }
+            bool measure = false;
+            states_in_use(s.pump_power != 1.0f || measure);
+            set_pump_power(client, s.entity, extras_blocked() ? 1.0f : s.pump_power, pump.found && pump.pumping, measure);
+        }
         // The revert boost adds speed, so it keeps to the session's rule for boosts and to a host's physics.
         set_revert_boost(client, s.entity, s.enforced || (multiplayer_session_active() && !session_boosts_allowed()) ? 0.0f : s.revert_boost, s.revert);
         if (const auto report = revert_boost_report(); report.sequence != s.revert_boosts_seen) {
@@ -1817,36 +1894,6 @@ void tick(std::uintptr_t base, std::uintptr_t client, bool playing, const std::s
 }
 
 namespace {
-// Every tick: the framing for what the skater is doing, or none.
-void drive_camera(bool playing) {
-    auto &s = state();
-    multiplayer::CustomCamera camera;
-    const auto &set = s.telemetry.physics_state == addr::no_bail::offboard_physics_state ? s.camera_foot : s.camera_board;
-    camera.on = s.camera_on && playing && s.telemetry.skater;
-    camera.position = s.telemetry.position;
-    camera.heading = s.telemetry.heading;
-    camera.distance = set.distance;
-    camera.height = set.height;
-    camera.pitch = set.pitch;
-    camera.side = set.side;
-    camera.fov = set.fov;
-    camera.lag = set.lag;
-    multiplayer::set_custom_camera(camera);
-    want_camera_rigs(s.rigs);
-    if (playing && s.telemetry.skater) (void)apply_camera_rigs(GetTickCount64());
-}
-constexpr std::string_view rig_names[]{"low", "high", "foot"};
-float *rig_field(RigSetting &rig, std::string_view name) {
-    return name == "distance" ? &rig.distance : name == "height" ? &rig.height : name == "raise" ? &rig.raise : name == "side" ? &rig.side : nullptr;
-}
-RigSetting sane_rig(RigSetting rig) {
-    const auto finite = [](float value, float low, float high, float otherwise) { return std::isfinite(value) ? std::clamp(value, low, high) : otherwise; };
-    rig.distance = finite(rig.distance, -1000.0f, 1000.0f, 1.0f);
-    rig.height = finite(rig.height, -1000.0f, 1000.0f, 0.0f);
-    rig.raise = finite(rig.raise, -1000.0f, 1000.0f, 0.0f);
-    rig.side = finite(rig.side, -1000.0f, 1000.0f, 1.0f);
-    return rig;
-}
 // ---- tricklining -------------------------------------------------------------------------------
 // trainer revert <field> <number> | reset: what counts as a revert and what it is worth.
 std::string revert_command(const std::vector<std::string> &a) {
@@ -1882,7 +1929,10 @@ std::string feel_command(const std::vector<std::string> &a) {
     if (!editable(&why)) return "error: " + why;
     const auto found = std::ranges::find(feels, which, [](const auto &feel) { return feel.first; });
     if (found == std::end(feels) && which != "stock" && which != "skate") return "error: usage: trainer feel stock|easy|normal|hardcore";
-    for (const auto &feel : feels) (void)remove_preset(feel.second);
+    // Only a feel that is on is taken off: taking off one that is not would put back values the
+    // player set themselves that it happens to share (the push speed dial, for one).
+    for (const auto &feel : feels)
+        if (std::ranges::find(state().active, feel.second) != state().active.end()) (void)remove_preset(feel.second);
     if (found != std::end(feels)) (void)apply_preset(found->second);
     changed();
     return found == std::end(feels) ? "Plays like skate.: the game's own tuning." : std::format("Plays like {}: its tuning for everything this game shares with it.", found->second);
@@ -1900,81 +1950,6 @@ std::string trickline_command(const std::vector<std::string> &a) {
     s.revert_boost = on ? std::max(s.revert_boost, 1.0f) : 0.0f;
     changed();
     return on ? "Tricklining extras on: the board bending boost, heavier revert and powerslide friction." : "Tricklining extras off.";
-}
-// The game's own cameras: `trainer camera rig low|high|foot <field> <number>`, or a preset for all three.
-std::string rig_command(const std::vector<std::string> &a) {
-    auto &s = state();
-    const auto arg = [&](std::size_t i) { return i < a.size() ? lower(a[i]) : std::string{}; };
-    if (arg(1) == "stock") {
-        s.rigs = {};
-        changed();
-        return "The game's cameras are where the game puts them.";
-    }
-    if (arg(1) == "sunjay") {
-        // SunJay's Low Cam (thunderstore.io/c/reskate/p/SunJayTeam/SunJays_Low_Cam): both on-board
-        // cameras 1.2 m back, 0.4 m lower, turning about a point 0.4 m lower.
-        s.rigs[0] = {1.2f / 1.9f, -0.4f, -0.4f, 1.0f / 1.35f};
-        s.rigs[1] = {1.2f / 3.0f, -0.4f, -0.4f, 1.0f};
-        changed();
-        return "Both on-board cameras set like SunJay's Low Cam.";
-    }
-    if (arg(1) == "low+") {
-        s.rigs[0] = {0.8f, -0.25f, -0.15f, 0.85f};
-        changed();
-        return "Low camera: lower and closer, with more of the skater in view.";
-    }
-    const auto found = std::ranges::find(rig_names, arg(1));
-    auto *field = found != std::end(rig_names) ? rig_field(s.rigs[static_cast<std::size_t>(found - std::begin(rig_names))], arg(2)) : nullptr;
-    const auto value = number(arg(3));
-    if (!field || !value) return "error: usage: trainer camera rig low|high|foot distance|height|raise|side <number>, or camera rig stock|sunjay|low+";
-    *field = static_cast<float>(*value);
-    auto &rig = s.rigs[static_cast<std::size_t>(found - std::begin(rig_names))];
-    rig = sane_rig(rig);
-    changed();
-    return std::format("Camera {} {} = {:.3g}. {}", arg(1), arg(2), *field, camera_rigs_summary());
-}
-// trainer camera on|off | game | preset <name> | set board|foot <field> <number>
-std::string camera_command(const std::vector<std::string> &a) {
-    auto &s = state();
-    const auto arg = [&](std::size_t i) { return i < a.size() ? lower(a[i]) : std::string{}; };
-    const auto action = arg(0);
-    if (action == "rig") return rig_command(a);
-    bool on{};
-    if (flag(action, on)) {
-        s.camera_on = on;
-        changed();
-        return on ? "Your camera is on. It does not avoid walls; switch it off to get the game's back." : "The game's own camera is back.";
-    }
-    if (action == "game") {
-        const auto profile = multiplayer::gameplay_camera_profile();
-        if (profile.samples < 60) return "error: skate for a few seconds with the game's own camera first, so it can be measured.";
-        s.camera_board = sane_camera({profile.distance, profile.height, profile.pitch, 0.0f, 0.0f, 0.1f});
-        changed();
-        return std::format("On board: the game's framing, {:.1f} m behind, {:.1f} m up, tilt {:.0f} degrees.", profile.distance, profile.height, profile.pitch);
-    }
-    if (action == "preset") {
-        std::string name;
-        for (std::size_t i = 1; i < a.size(); ++i) name += (i > 1 ? " " : "") + lower(a[i]);
-        for (const auto &preset : camera_presets)
-            if (lower(preset.name) == name) {
-                (preset.foot ? s.camera_foot : s.camera_board) = preset.set;
-                s.camera_on = true;
-                changed();
-                return std::format("Camera: {} ({}).", preset.name, preset.foot ? "on foot" : "on board");
-            }
-        return "error: no camera preset is called \"" + name + "\".";
-    }
-    if (action == "set") {
-        auto *set = arg(1) == "board" ? &s.camera_board : arg(1) == "foot" ? &s.camera_foot : nullptr;
-        auto *field = set ? camera_field(*set, arg(2)) : nullptr;
-        const auto value = number(arg(3));
-        if (!field || !value) return "error: usage: trainer camera set board|foot distance|height|pitch|side|fov|lag <number>";
-        *field = static_cast<float>(*value);
-        *set = sane_camera(*set);
-        changed();
-        return std::format("Camera {} {} = {:.3g}", arg(1), arg(2), *field);
-    }
-    return "error: usage: trainer camera on|off | game | preset <name> | set board|foot <field> <number>";
 }
 std::string run(std::string_view verb, const std::vector<std::string> &a) {
     auto &s = state();
@@ -1996,8 +1971,10 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
                           : std::format("{} values put back.", count);
         }
         if (v == "reset" && lower(arg(0)) == "tricks") {
-            s.hippy_height = s.nocomply_height = s.boneless_height = s.offboard_height = s.flip_speed = 1.0f;
-            s.flip_gate = true;
+            s.hippy_height = s.nocomply_height = s.boneless_height = s.offboard_height = s.flip_speed = s.pump_power = 1.0f;
+            s.catch_at = false;
+            s.flip_advanced = false;
+            s.flip_trick.fill(1.0f);
             s.revert_boost = 0.0f;
             changed();
             return "Trick heights and flip trick speed are the game's own again.";
@@ -2023,10 +2000,10 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
             }
             s.saved.clear();
             s.active.clear();
-            s.camera_on = false;
-            s.rigs = {};
-            s.hippy_height = s.nocomply_height = s.boneless_height = s.offboard_height = s.flip_speed = 1.0f;
-            s.flip_gate = true;
+            s.hippy_height = s.nocomply_height = s.boneless_height = s.offboard_height = s.flip_speed = s.pump_power = 1.0f;
+            s.catch_at = false;
+            s.flip_advanced = false;
+            s.flip_trick.fill(1.0f);
             s.revert_boost = 0.0f;
             s.revert = {};
             changed();
@@ -2094,7 +2071,11 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
                 if (e.touched) values[e.key] = e.value;
             for (const auto trick : trick_names)
                 if (const auto *option = trick_option(trick); *option != trick_stock(trick)) values[std::string(trick_prefix) + std::string(trick)] = *option;
-        if (!s.flip_gate) values[std::string(trick_prefix) + std::string(flip_gate_name)] = 0;
+        if (s.flip_advanced) values[std::string(trick_prefix) + std::string(flip_advanced_name)] = 1;
+        if (s.catch_at) {
+            values[std::string(trick_prefix) + std::string(catch_at_name)] = 1;
+            values[std::string(trick_prefix) + std::string(catch_percent_name)] = s.catch_percent;
+        }
             if (values.empty()) return "error: nothing is changed, so there is nothing to save.";
             const auto count = values.size();
             s.user[name] = std::move(values);
@@ -2109,7 +2090,6 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
         }
         return "error: usage: trainer preset apply|save|delete <name>";
     }
-    if (v == "camera") return camera_command(a);
     if (v == "revert") return revert_command(a);
     if (v == "trickline") return trickline_command(a);
     if (v == "feel") return feel_command(a);
@@ -2158,36 +2138,52 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
         const auto name = lower(arg(0));
         bool on{};
         std::string why;
-        if (name == "flip_speed") {
+        if (name == "flip_speed" || name.starts_with("flip.")) {
             const auto value = number(arg(1));
-            if (!value) return "error: flip_speed needs a multiplier, 1 = the game's own speed.";
+            auto *option = trick_option(name);
+            if (!option) return "error: no such flip trick. flip_speed is all of them; flip.kickflip, flip.360flip ... are one each.";
+            if (!value) return "error: " + name + " needs a multiplier, 1 = the game's own speed.";
             if (!editable(&why)) return "error: " + why;
-            s.flip_speed = std::clamp(static_cast<float>(*value), flip_low, flip_high);
+            *option = std::clamp(static_cast<float>(*value), flip_low, flip_high);
         } else if (name == "hippy_height" || name == "nocomply_height" || name == "boneless_height" || name == "offboard_height") {
             const auto value = number(arg(1));
             if (!value) return "error: " + name + " needs a multiplier, 1 = the game's own height.";
             if (!editable(&why)) return "error: " + why;
             (name == "hippy_height" ? s.hippy_height : name == "nocomply_height" ? s.nocomply_height : name == "offboard_height" ? s.offboard_height : s.boneless_height) =
                 std::clamp(static_cast<float>(*value), height_low, height_high);
+        } else if (name == "pump_power") {
+            const auto value = number(arg(1));
+            if (!value) return "error: pump_power needs a multiplier, 1 = what the game's own pump gains.";
+            if (!editable(&why)) return "error: " + why;
+            s.pump_power = std::clamp(static_cast<float>(*value), 0.0f, pump_high);
         } else if (name == "revert_boost") {
             const auto value = number(arg(1));
             if (!value) return "error: revert_boost needs a strength: 0 is off, 1 gives back about 2 m/s on an auto revert.";
             if (!editable(&why)) return "error: " + why;
             s.revert_boost = std::clamp(static_cast<float>(*value), 0.0f, revert_boost_high);
+        } else if (name == "catch_percent") {
+            const auto value = number(arg(1));
+            if (!value) return "error: catch_percent needs a percent of the air time.";
+            if (!editable(&why)) return "error: " + why;
+            s.catch_percent = std::clamp(static_cast<float>(*value), catch_low, catch_high);
         } else if (name == "return_delay") {
             const auto value = number(arg(1));
             if (!value) return "error: return_delay needs seconds.";
             s.return_delay = std::clamp(static_cast<float>(*value), 0.0f, 10.0f);
         } else if (!flag(arg(1), on)) {
-            return "error: usage: trainer option hud|hud_jump|auto_return|pad|pad_menu|flip_gate|log 0|1";
+            return "error: usage: trainer option hud|hud_jump|auto_return|pad|pad_menu|flip_advanced|catch_at|log 0|1";
         } else if (name == "hud") s.hud = on;
         else if (name == "hud_jump") s.hud_jump = on;
         else if (name == "auto_return") s.auto_return = on;
         else if (name == "pad") s.pad_shortcuts = on;
         else if (name == "pad_menu") s.pad_menu = on;
-        else if (name == "flip_gate") {
-            if (!on && !editable(&why)) return "error: " + why;
-            s.flip_gate = on;
+        else if (name == "flip_gate") return "That switch is gone: a flip set slower than the game's own stays slow by itself.";
+        else if (name == "catch_at") {
+            if (on && !editable(&why)) return "error: " + why;
+            s.catch_at = on;
+        } else if (name == "flip_advanced") {
+            if (on && !editable(&why)) return "error: " + why;
+            s.flip_advanced = on;
         }
         else if (name == "log") {
             set_logging(on);
@@ -2216,7 +2212,7 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
         // The last three are the Tune tab on one of its lists.
         const std::array<std::string_view, 9> tabs{"tune", "presets", "practice", "map", "realistic", "fun", "everything", "camera", "trickline"};
         const auto found = std::ranges::find(tabs, tab);
-        if (!tab.empty() && found == tabs.end()) return "error: usage: trainer open [tune|trickline|practice|camera|map|realistic|fun|everything]";
+        if (!tab.empty() && found == tabs.end()) return "error: usage: trainer open [tune|trickline|practice|map|realistic|fun|everything]";
         s.open_tab = tab.empty() ? 1 : static_cast<int>(found - tabs.begin());
         ++s.open_serial;
         s.view_due = true;
