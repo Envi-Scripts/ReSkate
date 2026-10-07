@@ -17,7 +17,7 @@ namespace {
 struct Page {
     int tab{}; // opens on TUNE: the dials and switches
     std::array<char, 96> search{};
-    int mode{1}; // the Tune tab: 0 Realistic, 1 Fun (two short lists), 2 Everything
+    int mode{1}; // the Tune tab: 0 Realistic, 1 Fun (two short lists), 3 Tricklining, 2 Everything
     int group{1}; // Everything: 1: every group, 2..: one of the view's groups
     bool only_changed{}, graph_points{}, show_unused{};
     std::size_t hidden_unused{}; // rows the filters would show but for "no use found"
@@ -239,6 +239,70 @@ void dial_row(SkateMenu &menu, const CallbacksV3 &callbacks, Page &p, const trai
 // One screen for everything that changes how the game plays: the presets as dials and
 // switches, the trick multipliers, the player's own presets and the values themselves. All of
 // them show the same values, so none can disagree with another.
+// The player's own presets: save what is set now under a name, turn one on or off, share one as a
+// line of text, import one that was shared.
+void your_presets(SkateMenu &menu, const CallbacksV3 &callbacks, Page &p, const trainer::View &view, bool can_edit) {
+    begin_card(menu, "preset-save", "YOUR PRESETS", "Save a setup you like, go back to it, share it");
+    ImGui::BeginDisabled(!can_edit);
+    const float button = ImGui::CalcTextSize("Turn off").x + ImGui::GetStyle().FramePadding.x * 2;
+    for (const auto &preset : view.presets) {
+        if (preset.builtin) continue;
+        ImGui::PushID(preset.name.c_str());
+        if (preset.active) {
+            ImGui::PushStyleColor(ImGuiCol_Button, skate_theme::blue);
+            if (ImGui::Button("Turn off", ImVec2(button, 0))) trainer_command(menu, callbacks, "preset remove " + preset.name);
+            ImGui::PopStyleColor();
+        } else if (ImGui::Button("Turn on", ImVec2(button, 0))) {
+            trainer_command(menu, callbacks, "preset apply " + preset.name);
+        }
+        tip("Turn on sets every value saved in this preset. Turn off puts those values back to the game's own.");
+        ImGui::SameLine();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(preset.name.c_str());
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", preset.note.c_str());
+        ImGui::SameLine(ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() - px(170));
+        if (ImGui::SmallButton("This map")) trainer_command(menu, callbacks, "profile set " + preset.name);
+        tip("Applies this preset by itself every time this map loads.");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Share")) trainer_command(menu, callbacks, "preset export " + preset.name);
+        if (ImGui::IsItemHovered()) wrapped_tooltip("Copies this preset to the clipboard as one line of text. Paste it in a chat;\nanyone with the trainer can import it.");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Delete")) trainer_command(menu, callbacks, "preset delete " + preset.name);
+        tip("Removes this preset from your list.");
+        ImGui::PopID();
+    }
+    ImGui::EndDisabled();
+    field(menu, "Name");
+    const float save = ImGui::CalcTextSize("Save").x + ImGui::GetStyle().FramePadding.x * 2;
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - save - ImGui::GetStyle().ItemSpacing.x);
+    ImGui::InputText("##preset-name", p.preset_name.data(), p.preset_name.size());
+    tip("A name for the preset you are about to save.");
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!p.preset_name[0] || view.stock);
+    if (ImGui::Button("Save", ImVec2(save, 0))) trainer_command(menu, callbacks, std::string("preset save ") + p.preset_name.data());
+    tip("Saves every value, dial and trick setting that is changed right now as a preset under this name. Share it from its row afterwards.");
+    ImGui::EndDisabled();
+    // Sharing: a preset travels as one line of text on the clipboard.
+    ImGui::BeginDisabled(view.stock);
+    if (ImGui::Button("Share what is changed now")) trainer_command(menu, callbacks, "preset export current");
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) wrapped_tooltip("Copies your current setup to the clipboard as one line of text.");
+    ImGui::SameLine();
+    if (ImGui::Button("Import from clipboard")) {
+        const char *text = ImGui::GetClipboardText();
+        if (text && trainer::stage_import(text)) trainer_command(menu, callbacks, "preset import");
+        else feedback(menu, "The clipboard holds no text.");
+    }
+    if (ImGui::IsItemHovered()) wrapped_tooltip("Copy a preset line someone shared (it starts with RST1:), then press this.\nIt is added to your presets; nothing changes until you turn it on.");
+    if (!view.map.empty()) {
+        info(menu, "This map applies", view.profile_preset.empty() ? "nothing" : view.profile_preset);
+        if (!view.profile_preset.empty() && ImGui::Button("Stop applying it on this map")) trainer_command(menu, callbacks, "profile clear");
+        note("\"This map\" beside one of your presets applies it every time this map loads.");
+    }
+    end_card();
+}
+
 void tune_tab(SkateMenu &menu, const Model &model, const CallbacksV3 &callbacks, Page &p, const trainer::View &view) {
     if (!view.ready) {
         begin_card(menu, "tune-wait", "PHYSICS TUNING");
@@ -261,7 +325,7 @@ void tune_tab(SkateMenu &menu, const Model &model, const CallbacksV3 &callbacks,
             tip(mode == 0 ? "A short list for toning the game down: lower pops, slower pushes, harder bails."
                 : mode == 1 ? "A short list for turning the game up: bigger pops, faster pushes, moon jumps."
                 : mode == 3 ? "Everything that makes a trick line in one place: board bending, reverts, pumping, pops, spins, manuals and grinds."
-                            : "Every dial, your own presets and every tuning value the trainer knows.");
+                            : "Every dial and every tuning value the trainer knows.");
             if (on) ImGui::PopStyleColor();
         }
     }
@@ -277,10 +341,11 @@ void tune_tab(SkateMenu &menu, const Model &model, const CallbacksV3 &callbacks,
         return searching ? contains_words(lower(preset.title + " " + preset.name + " " + preset.note), words) : p.mode == 2 || (preset.modes & list) != 0;
     };
 
-    if (!searching) {
+    // The whole-game choices (Play like, the player's saved setups) are on MAP & HUD; a trick line
+    // is the one list that is about a whole feel, so it keeps the choice at hand.
+    if (!searching && p.mode == 3) {
         begin_card(menu, "feel", "PLAY LIKE", "The game's own tuning, or Skate 3's on one of its difficulties");
-        if (p.mode == 3)
-            note("A Skate 3 choice sets Skate 3's own numbers for everything the two games share (pop, grind pops, pushing, pumping, steering, "
+        note("A Skate 3 choice sets Skate 3's own numbers for everything the two games share (pop, grind pops, pushing, pumping, steering, "
                  "manuals, spins, bails), and for grinds the way they were before skate.: the older grind friction, Skate 3's lock-on distances, wider slide "
                  "angles, and no automatic turning between grinds. What a number cannot change stays skate.'s: animations and which stick "
                  "motion asks for which grind.");
@@ -324,73 +389,13 @@ void tune_tab(SkateMenu &menu, const Model &model, const CallbacksV3 &callbacks,
     ImGui::SameLine();
     ImGui::AlignTextToFramePadding();
     ImGui::TextDisabled("%zu values changed", view.touched);
+    note("To save or share the whole setup under a name, or to play like Skate 3: MAP & HUD, at the bottom.");
     end_card();
 
     ImGui::BeginDisabled(!can_edit);
     trick_heights(menu, callbacks, p, view, words);
     ImGui::EndDisabled();
 
-    if (p.mode == 2 && !searching) {
-        begin_card(menu, "preset-save", "YOUR PRESETS", "Save what is changed right now");
-        ImGui::BeginDisabled(!can_edit);
-        const float button = ImGui::CalcTextSize("Turn off").x + ImGui::GetStyle().FramePadding.x * 2;
-        for (const auto &preset : view.presets) {
-            if (preset.builtin) continue;
-            ImGui::PushID(preset.name.c_str());
-            if (preset.active) {
-                ImGui::PushStyleColor(ImGuiCol_Button, skate_theme::blue);
-                if (ImGui::Button("Turn off", ImVec2(button, 0))) trainer_command(menu, callbacks, "preset remove " + preset.name);
-                ImGui::PopStyleColor();
-            } else if (ImGui::Button("Turn on", ImVec2(button, 0))) {
-                trainer_command(menu, callbacks, "preset apply " + preset.name);
-            }
-            tip("Turn on sets every value saved in this preset. Turn off puts those values back to the game's own.");
-            ImGui::SameLine();
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted(preset.name.c_str());
-            ImGui::SameLine();
-            ImGui::TextDisabled("%s", preset.note.c_str());
-            ImGui::SameLine(ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() - px(170));
-            if (ImGui::SmallButton("This map")) trainer_command(menu, callbacks, "profile set " + preset.name);
-            tip("Applies this preset by itself every time this map loads.");
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Share")) trainer_command(menu, callbacks, "preset export " + preset.name);
-            if (ImGui::IsItemHovered()) wrapped_tooltip("Copies this preset to the clipboard as one line of text. Paste it in a chat;\nanyone with the trainer can import it.");
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Delete")) trainer_command(menu, callbacks, "preset delete " + preset.name);
-            tip("Removes this preset from your list.");
-            ImGui::PopID();
-        }
-        ImGui::EndDisabled();
-        field(menu, "Name");
-        const float save = ImGui::CalcTextSize("Save").x + ImGui::GetStyle().FramePadding.x * 2;
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - save - ImGui::GetStyle().ItemSpacing.x);
-        ImGui::InputText("##preset-name", p.preset_name.data(), p.preset_name.size());
-        tip("A name for the preset you are about to save.");
-        ImGui::SameLine();
-        ImGui::BeginDisabled(!p.preset_name[0] || !view.touched);
-        if (ImGui::Button("Save", ImVec2(save, 0))) trainer_command(menu, callbacks, std::string("preset save ") + p.preset_name.data());
-        tip("Saves every value, dial and trick setting that is changed right now as a preset under this name. Share it from its row afterwards.");
-        ImGui::EndDisabled();
-        // Sharing: a preset travels as one line of text on the clipboard.
-        ImGui::BeginDisabled(view.stock);
-        if (ImGui::Button("Share what is changed now")) trainer_command(menu, callbacks, "preset export current");
-        ImGui::EndDisabled();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) wrapped_tooltip("Copies your current setup to the clipboard as one line of text.");
-        ImGui::SameLine();
-        if (ImGui::Button("Import from clipboard")) {
-            const char *text = ImGui::GetClipboardText();
-            if (text && trainer::stage_import(text)) trainer_command(menu, callbacks, "preset import");
-            else feedback(menu, "The clipboard holds no text.");
-        }
-        if (ImGui::IsItemHovered()) wrapped_tooltip("Copy a preset line someone shared (it starts with RST1:), then press this.\nIt is added to your presets; nothing changes until you turn it on.");
-        if (!view.map.empty()) {
-            info(menu, "This map applies", view.profile_preset.empty() ? "nothing" : view.profile_preset);
-            if (!view.profile_preset.empty() && ImGui::Button("Stop applying it on this map")) trainer_command(menu, callbacks, "profile clear");
-            note("\"This map\" beside one of your presets applies it every time this map loads.");
-        }
-        end_card();
-    }
 
     // The values themselves: the short list's, or all of them.
     ImGui::Spacing();
@@ -849,7 +854,7 @@ void trickline_section(SkateMenu &menu, const CallbacksV3 &callbacks, Page &p, c
 }
 
 
-void map_tab(SkateMenu &menu, const CallbacksV3 &callbacks, const trainer::View &view) {
+void map_tab(SkateMenu &menu, const CallbacksV3 &callbacks, Page &p, const trainer::View &view) {
     const auto telemetry = trainer::telemetry();
     begin_card(menu, "hud", "HUD");
     bool hud = view.hud, jump = view.hud_jump, logging = view.logging;
@@ -904,6 +909,20 @@ void map_tab(SkateMenu &menu, const CallbacksV3 &callbacks, const trainer::View 
     if (view.map_note.empty() && view.map_preset.empty() && view.spots.empty())
         note("Map makers can ship a trainer.json in their mod folder with spots and a recommended preset.");
     end_card();
+
+    // The whole game at once: which game it plays like, and the player's own saved setups. (The
+    // presets on TUNE each change one thing.)
+    if (view.ready) {
+        const bool can_edit = view.editable && callbacks.queue_console_command != nullptr;
+        begin_card(menu, "feel", "PLAY LIKE", "The game's own tuning, or Skate 3's on one of its difficulties");
+        ImGui::BeginDisabled(!can_edit);
+        feel_buttons(menu, callbacks, view);
+        ImGui::EndDisabled();
+        note("A Skate 3 choice sets Skate 3's own numbers for everything the two games share. The dials and switches on TUNE each change one "
+             "thing: set those as you like, then save the whole setup below.");
+        end_card();
+        your_presets(menu, callbacks, p, view, can_edit);
+    }
 }
 } // namespace
 
@@ -912,8 +931,8 @@ bool trainer_take_open() {
     auto &p = page();
     if (view->open_serial == p.open_serial) return false;
     p.open_serial = view->open_serial;
-    // `trainer open` still takes "presets": they live on the Tune tab now.
-    p.tab = view->open_tab == 3 ? 2 : view->open_tab == 2 ? 1 : 0; // by name, see `trainer open`
+    // "presets": the player's saved setups are at the bottom of MAP & HUD.
+    p.tab = view->open_tab == 3 || view->open_tab == 1 ? 2 : view->open_tab == 2 ? 1 : 0; // by name, see `trainer open`
     if (view->open_tab == 8) p.mode = 3; // the trick line section of the Tune tab
     if (view->open_tab >= 4 && view->open_tab < 7) p.mode = std::clamp(view->open_tab - 4, 0, 2);
     p.show_page = true;
@@ -971,7 +990,7 @@ void trainer_page(SkateMenu &menu, const Model &model, const CallbacksV3 &callba
     switch (p.tab) {
     case 0: tune_tab(menu, model, callbacks, p, *view); break;
     case 1: practice_tab(menu, model, callbacks, p, *view); break;
-    default: map_tab(menu, callbacks, *view); break;
+    default: map_tab(menu, callbacks, p, *view); break;
     }
     ImGui::EndChild();
     ImGui::PopID();
