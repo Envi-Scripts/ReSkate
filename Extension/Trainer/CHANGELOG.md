@@ -10,6 +10,15 @@
   AutoRevertBoost. Settings saved by 0.4.1 with the old 12 are moved to off. Turn the rule on
   yourself and a landing that counts by it alone gets the auto revert boost at most. Found and
   measured by AutoRevertBoost's authors (Sivaes, jaq and OVM).
+- **Flip trick speed no longer lowers your ollie.** The slider used to scale seven of the game's
+  flip curves and shrink the range each one is read over; three of those are what a flick adds
+  to the height of the pop, so a slow flip came with a low ollie. It now scales only the one
+  curve that turns the stick's speed into the flip's speed. Measured on flat ground at x 0.3:
+  kickflips at about half the game's turn rate, plain ollies the same height and air time as
+  with the slider untouched.
+- **Let slow flips stay slow says when it is off.** In a session whose host enforces physics or
+  has turned trick settings off, the switch cannot act (the likely reason it seemed to work only on
+  the main map); a line under it now says so.
 
 ## v0.4.1 - 2026-10-06
 

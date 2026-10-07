@@ -1541,6 +1541,7 @@ void build_view() {
     next->flip_speed = s.flip_speed;
     next->flip_gate = s.flip_gate;
     next->flip_gate_found = flip_gates() != 0;
+    next->flip_gate_blocked = !s.flip_gate && (s.enforced || (multiplayer_session_active() && !session_boosts_allowed()));
     next->boneless_height = s.boneless_height;
     next->revert_boost = s.revert_boost;
     next->revert = s.revert;
@@ -1758,6 +1759,7 @@ void tick(std::uintptr_t base, std::uintptr_t client, bool playing, const std::s
                 find_classes();
             }
         }
+        flip_speed_in_use(s.boosts.flip != 1.0f);
         want_flip_speed(s.boosts.flip);
         // The player's own choice, and only where their own trick settings count: not under a
         // host's enforced physics or in a session that has turned boosts off.

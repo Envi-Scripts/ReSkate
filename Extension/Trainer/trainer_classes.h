@@ -51,6 +51,9 @@ std::string classes_summary();
 // (speed against the flick, against the ollie...); the search finds it as eight curve references
 // in a row and apply_classes multiplies the outputs of its four speed curves by this.
 void want_flip_speed(float factor) noexcept;
+// The player has a flip speed of their own set, whether or not it is written right now (it is
+// written only while the board is in the air): the curves must be found either way.
+void flip_speed_in_use(bool used) noexcept;
 // How many flip trick speed curves were found (0: the multiplier does nothing yet).
 std::size_t flip_curves() noexcept;
 // The game hurries a flip trick so that it is round 1/6 s before the landing it predicts, however
